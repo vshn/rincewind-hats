@@ -1,0 +1,328 @@
+# All things node related: the kubelet, scheduling, and the machine-config
+# rollout — plus the pools that drive it.
+
+views:
+  # Port of the old builtin `nodes status`: kubelet, scheduling and
+  # machine-config rollout. The CONFIG column judges a node against its
+  # pool's rendered target — the state annotation alone reads "Done" on a
+  # node the operator has not even told about a new config yet. That join
+  # needs both nodes and pools, so the script does it with jq and emits one
+  # enriched node object per stream value; the columns then only look at
+  # their own row. Needs jq on the PATH; pools are best effort, so the view
+  # keeps working on clusters without the MachineConfig operator.
+  - id: nodes.status
+    title: Kubelet, scheduling and machine-config rollout
+    # Optional: empty lists every node, set it lists one pool's. The value
+    # reaches the script as $selector, never templated into it, so a label
+    # taken from cluster data cannot become shell code.
+    params:
+      - name: selector
+        short: label selector, as kubectl -l takes it
+    source:
+      script: |
+        d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
+        # Use `if ... fi`, not `[ -n "$x" ] && ...`: the && form leaves exit
+        # status 1 when the parameter is empty, which reads as a failure.
+        if [ -n "$selector" ]; then set -- -l "$selector"; fi
+        kubectl get nodes "$@" -o json > "$d/nodes.json"
+        kubectl get machineconfigpools -o json > "$d/pools.json" 2>/dev/null \
+          || echo '{"items":[]}' > "$d/pools.json"
+        jq -s '
+          .[1].items as $pools
+          | .[0].items[]
+          | . as $n
+          | ($n.metadata.labels // {}) as $lbl
+          | [ $pools[]
+              | (.spec.nodeSelector.matchLabels // {}) as $sel
+              | select(($sel | length) > 0
+                  and ([$sel | to_entries[] | $lbl[.key] == .value] | all)) ] as $matching
+          | ( [ $matching[] | select(.metadata.name == "master") ][0]
+              // ( [ $matching[] | select(.metadata.name != "master" and .metadata.name != "worker") ]
+                   | sort_by([-(.spec.nodeSelector.matchLabels | length), .metadata.name]) | .[0] )
+              // [ $matching[] | select(.metadata.name == "worker") ][0]
+            ) as $pool
+          | $n + {poolTarget: ($pool.status.configuration.name // "")}
+        ' "$d/nodes.json" "$d/pools.json"
+    rows: .
+    key: .metadata.name
+    columns:
+      - name: NAME
+        expr: .metadata.name
+      - name: ROLE
+        expr: >-
+          [(.metadata.labels // {}) | keys[]
+           | select(startswith("node-role.kubernetes.io/"))
+           | ltrimstr("node-role.kubernetes.io/")
+           | select(. != "")] | sort | join(",")
+      # A node whose Ready condition is missing entirely still gets a row.
+      - name: READY
+        expr: >-
+          [.status.conditions[]? | select(.type == "Ready")][0] as $c
+          | if $c == null then "Unknown"
+            elif $c.status == "True" then "Ready"
+            elif $c.status == "False" then "NotReady"
+            else "Unknown" end
+        emphasis: { Ready: good, NotReady: bad, Unknown: bad }
+      # An absolute timestamp rather than an age: this column exists to be
+      # lined up against job start times and log lines, and "4h59m" cannot.
+      - name: SINCE
+        expr: >-
+          [.status.conditions[]? | select(.type == "Ready")][0].lastTransitionTime // ""
+        format: timestamp
+      - name: SCHED
+        expr: if .spec.unschedulable then "cordoned" else "" end
+        emphasis: { cordoned: warn }
+      # "pending": told to change, has not finished. "behind": not told yet,
+      # the pool has moved on without it.
+      - name: CONFIG
+        expr: >-
+          (.metadata.annotations // {}) as $a
+          | ($a["machineconfiguration.openshift.io/state"] // "") as $state
+          | ($a["machineconfiguration.openshift.io/currentConfig"] // "") as $cur
+          | ($a["machineconfiguration.openshift.io/desiredConfig"] // "") as $desired
+          | if $state == "Degraded" or $state == "Working" then $state
+            elif $cur == "" then $state
+            elif $desired != "" and $cur != $desired then "pending"
+            elif .poolTarget != "" and $cur != .poolTarget then "behind"
+            else $state end
+        emphasis: { Degraded: bad, Working: warn, pending: warn, behind: warn, Done: good }
+      - name: VERSION
+        expr: .status.nodeInfo.kubeletVersion
+      # The operator's reason when the rollout is unhappy: "failed to drain
+      # node" beats "kubelet is posting ready status" as an explanation.
+      - name: MESSAGE
+        expr: >-
+          (.metadata.annotations // {}) as $a
+          | ($a["machineconfiguration.openshift.io/reason"] // "") as $reason
+          | if ($a["machineconfiguration.openshift.io/state"] == "Degraded" and $reason != "")
+            then $reason
+            else ([.status.conditions[]? | select(.type == "Ready")][0].message // "") end
+    # Trouble first: broken kubelet, then a struggling rollout, then merely
+    # cordoned; within a class the most recent change on top.
+    sort:
+      - by: READY
+        rank: [NotReady, Unknown, Ready]
+      - by: CONFIG
+        rank: [Degraded, Working, pending, behind]
+      - by: SCHED
+        rank: [cordoned]
+      - by: SINCE
+        order: desc
+      - by: NAME
+    actions:
+      - key: enter
+        name: conditions
+        short: Show this node's conditions
+        open: nodes.conditions
+        args:
+          node: .metadata.name
+      - key: m
+        name: config
+        short: Show this node's machine-config rollout
+        open: nodes.config
+        args:
+          node: .metadata.name
+
+      # Cordon only stops new pods landing; it does not move the ones already
+      # there. Saying so is the difference between this and a drain, which
+      # this tool deliberately does not offer.
+      - key: c
+        name: cordon
+        short: Stop scheduling
+        confirm: >-
+          "Stop scheduling on \(map(.metadata.name) | join(", "))" +
+          "\n\nRunning pods stay where they are; this only stops new ones landing."
+        env:
+          node: .metadata.name
+        script: |
+          kubectl --as system:admin patch node "$node" \
+            --type merge -p '{"spec":{"unschedulable":true}}'
+        reload: true
+
+      - key: C
+        name: uncordon
+        short: Allow scheduling
+        confirm: '"Allow scheduling on \(map(.metadata.name) | join(", "))"'
+        env:
+          node: .metadata.name
+        script: |
+          kubectl --as system:admin patch node "$node" \
+            --type merge -p '{"spec":{"unschedulable":null}}'
+        reload: true
+
+  # MachineConfigPools, and the drill-down into the nodes one covers. This is
+  # what actions are for: `open` navigates, `script` works, and both derive
+  # what they need from the row with jq.
+  - id: nodes.pools
+    title: MachineConfigPools and their rollout
+    source:
+      script: kubectl get machineconfigpools -o json
+    rows: .items[]
+    key: .metadata.name
+    columns:
+      - name: NAME
+        expr: .metadata.name
+      - name: PAUSED
+        expr: if .spec.paused then "paused" else "" end
+        emphasis: { paused: warn }
+      - name: STATE
+        expr: >-
+          [.status.conditions[]? | select(.status == "True") | .type] as $on
+          | if ($on | index("Degraded")) then "Degraded"
+            elif ($on | index("Updating")) then "Updating"
+            elif ($on | index("Updated")) then "Updated"
+            else "Unknown" end
+        emphasis: { Degraded: bad, Updating: warn, Updated: good, Unknown: warn }
+      - name: READY
+        expr: '"\(.status.readyMachineCount // 0)/\(.status.machineCount // 0)"'
+      - name: TARGET
+        expr: .status.configuration.name // ""
+      - name: MESSAGE
+        expr: >-
+          [.status.conditions[]? | select(.type == "Degraded" and .status == "True")][0].message // ""
+    sort:
+      - by: STATE
+        rank: [Degraded, Updating, Updated]
+      - by: NAME
+    actions:
+      # Navigate: the chain one actually walks — the pool is stuck, which
+      # node is holding it up. Acts on the row under the cursor.
+      - key: enter
+        name: nodes
+        short: Show the nodes in this pool
+        open: nodes.status
+        args:
+          # Rendering only the matchLabels half of a selector that also has
+          # matchExpressions would list the wrong nodes, which is worse than
+          # saying no. The refusal travels as the tab's error.
+          selector: >-
+            if ((.spec.nodeSelector.matchExpressions // []) | length) > 0
+            then error("pool \(.metadata.name) selects nodes by expression, which this view cannot render; use kubectl")
+            elif ((.spec.nodeSelector.matchLabels // {}) | length) == 0
+            then error("pool \(.metadata.name) has no node selector")
+            else (.spec.nodeSelector.matchLabels | to_entries | sort_by(.key)
+                  | map("\(.key)=\(.value)") | join(","))
+            end
+
+      # Work: runs once per selected row. Select with ␣ or a first — a
+      # mutation never acts on merely what the filter left.
+      - key: p
+        name: pause
+        short: Pause the rollout
+        confirm: '"Pause the rollout of \(map(.metadata.name) | join(", "))"'
+        env:
+          name: .metadata.name
+        script: |
+          kubectl patch machineconfigpool "$name" --type merge \
+            -p '{"spec":{"paused":true}}'
+        reload: true
+
+      - key: P
+        name: resume
+        short: Resume the rollout
+        confirm: '"Resume the rollout of \(map(.metadata.name) | join(", "))"'
+        env:
+          name: .metadata.name
+        script: |
+          kubectl patch machineconfigpool "$name" --type merge \
+            -p '{"spec":{"paused":false}}'
+        reload: true
+
+  # Where the READY column above folds the kubelet's verdict into one word,
+  # this shows every condition — DiskPressure and MemoryPressure live here,
+  # and they are what one word cannot say.
+  - id: nodes.conditions
+    title: One node's conditions, as the kubelet wrote them
+    params:
+      - name: node
+        short: node name
+        required: true
+    source:
+      script: kubectl get nodes "$node" -o json
+    rows: .status.conditions[]?
+    key: .type
+    columns:
+      - name: WHEN
+        expr: .lastTransitionTime // ""
+        format: timestamp
+      - name: TYPE
+        expr: .type
+      # No emphasis: True is good on Ready and bad on DiskPressure.
+      - name: STATUS
+        expr: .status
+      - name: REASON
+        expr: .reason // ""
+      - name: MESSAGE
+        expr: .message // ""
+    sort:
+      - by: WHEN
+    actions:
+      - key: m
+        name: config
+        short: Show this node's machine-config rollout
+        open: nodes.config
+        args:
+          node: $args.node
+
+  # The rendered config names are far too long for a list, and are exactly
+  # what one compares against the pool when a rollout is stuck.
+  - id: nodes.config
+    title: One node's machine-config rollout in full
+    params:
+      - name: node
+        short: node name
+        required: true
+    source:
+      script: |
+        d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
+        kubectl get nodes "$node" -o json > "$d/node.json"
+        kubectl get machineconfigpools -o json > "$d/pools.json" 2>/dev/null \
+          || echo '{"items":[]}' > "$d/pools.json"
+        jq -s '
+          .[1].items as $pools
+          | .[0] as $n
+          | ($n.metadata.labels // {}) as $lbl
+          | [ $pools[]
+              | (.spec.nodeSelector.matchLabels // {}) as $sel
+              | select(($sel | length) > 0
+                  and ([$sel | to_entries[] | $lbl[.key] == .value] | all)) ] as $matching
+          | ( [ $matching[] | select(.metadata.name == "master") ][0]
+              // ( [ $matching[] | select(.metadata.name != "master" and .metadata.name != "worker") ]
+                   | sort_by([-(.spec.nodeSelector.matchLabels | length), .metadata.name]) | .[0] )
+              // [ $matching[] | select(.metadata.name == "worker") ][0]
+            ) as $pool
+          | ($n.metadata.annotations // {}) as $a
+          | ($a["machineconfiguration.openshift.io/state"] // "") as $state
+          | ($a["machineconfiguration.openshift.io/currentConfig"] // "") as $cur
+          | ($a["machineconfiguration.openshift.io/desiredConfig"] // "") as $desired
+          | ($pool.status.configuration.name // "") as $target
+          | [ {what: "state",
+               value: (if $state == "Degraded" or $state == "Working" then $state
+                       elif $cur == "" then $state
+                       elif $desired != "" and $cur != $desired then "pending"
+                       elif $target != "" and $cur != $target then "behind"
+                       else $state end)},
+              {what: "pool",         value: ($pool.metadata.name // "")},
+              {what: "pool target",  value: $target},
+              {what: "node desired", value: $desired},
+              {what: "node current", value: $cur},
+              {what: "annotation",   value: $state},
+              {what: "reason",       value: ($a["machineconfiguration.openshift.io/reason"] // "")},
+              {what: "schedulable",  value: (if $n.spec.unschedulable then "no" else "yes" end)} ]
+          | .[]
+        ' "$d/node.json" "$d/pools.json"
+    rows: .
+    key: .what
+    columns:
+      - name: WHAT
+        expr: .what
+      - name: VALUE
+        expr: .value
+        emphasis: { Degraded: bad, Working: warn, pending: warn, behind: warn, Done: good, "no": warn }
+    actions:
+      - key: enter
+        name: conditions
+        short: Show this node's conditions
+        open: nodes.conditions
+        args:
+          node: $args.node

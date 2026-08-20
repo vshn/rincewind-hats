@@ -1,0 +1,308 @@
+# All things cluster upgrade related: the appuio upgrade controller's jobs
+# and suspension windows, plus the cluster's own version state.
+
+views:
+  - id: upgrade.jobs
+    title: UpgradeJobs and where each one got to
+    source:
+      script: |
+        kubectl -n appuio-openshift-upgrade-controller get upgradejob -o json
+    rows: .items[]
+    key: .metadata.name
+    columns:
+      - name: NAME
+        expr: .metadata.name
+      - name: VERSION
+        expr: .spec.desiredVersion.version // ""
+      # STATE is folded out of the conditions, in this order — the controller
+      # leaves several of them True at once, and the first match is the one
+      # that answers "what happened to this job".
+      #
+      # "Expired" is the case no condition states: the start window closed
+      # while the job sat Pending, so it will never run.
+      - name: STATE
+        expr: >-
+          ([.status.conditions[]? | select(.type == "Succeeded")][0]) as $done
+          | ([.status.conditions[]? | select(.type == "Failed")][0]) as $failed
+          | ([.status.conditions[]? | select(.type == "Paused")][0]) as $paused
+          | ([.status.conditions[]? | select(.type == "Started")][0]) as $started
+          | if   ($done.status // "") == "True" then "Succeeded"
+            elif $done != null and ($done.reason // "") != ""
+                 and $done.reason != "Pending" then "Failed"
+            elif ($failed.status  // "") == "True" then "Failed"
+            elif ($paused.status  // "") == "True" then "Paused"
+            elif ($started.status // "") == "True" then "Running"
+            elif (.spec.startBefore // "") != ""
+                 and ((.spec.startBefore | fromdateiso8601) < now) then "Expired"
+            else "Pending" end
+        emphasis: { Failed: bad, Expired: bad, Running: warn, Paused: warn, Succeeded: good }
+      - name: START
+        expr: .spec.startAfter // ""
+        format: timestamp
+      - name: HOOKS
+        expr: >-
+          (.status.hookTracker // []) as $h
+          | if ($h | length) == 0 then ""
+            else "\([$h[] | select(.status == "complete")] | length)/\($h | length)" end
+      # The message of whichever condition moved last: the newest word the
+      # controller had on this job.
+      - name: MESSAGE
+        expr: >-
+          [.status.conditions[]? | select((.message // "") != "")]
+          | sort_by(.lastTransitionTime) | last | .message // ""
+    # A calendar, not a health list: ordering by state would move rows about
+    # on every reload. What needs attention is picked out by colour.
+    sort:
+      - by: START
+        order: desc
+      - by: NAME
+    actions:
+      - key: enter
+        name: conditions
+        short: Show this job's conditions
+        open: upgrade.conditions
+        args:
+          job: .metadata.name
+      - key: h
+        name: hooks
+        short: Show this job's hooks
+        open: upgrade.hooks
+        args:
+          job: .metadata.name
+
+  # Where the STATE column above guesses, this shows the controller's own
+  # account, which cannot be wrong.
+  - id: upgrade.conditions
+    title: One UpgradeJob's conditions, as the controller wrote them
+    params:
+      - name: job
+        short: upgrade job name
+        required: true
+    source:
+      script: |
+        kubectl -n appuio-openshift-upgrade-controller get upgradejob "$job" -o json
+    rows: .status.conditions[]?
+    key: .type
+    columns:
+      - name: AT
+        expr: .lastTransitionTime // ""
+        format: timestamp
+      - name: TYPE
+        expr: .type
+      # No emphasis on STATUS, deliberately: True is good on
+      # PreHealthCheckDone and bad on Paused.
+      - name: STATUS
+        expr: .status
+      - name: REASON
+        expr: .reason // ""
+      - name: MESSAGE
+        expr: .message // ""
+    sort:
+      - by: AT
+    actions:
+      - key: h
+        name: hooks
+        short: Show this job's hooks
+        open: upgrade.hooks
+        args:
+          job: $args.job
+
+  - id: upgrade.hooks
+    title: One UpgradeJob's hooks
+    params:
+      - name: job
+        short: upgrade job name
+        required: true
+    source:
+      script: |
+        kubectl -n appuio-openshift-upgrade-controller get upgradejob "$job" -o json
+    rows: .status.hookTracker[]?
+    key: '"\(.upgradeJobHook)/\(.event)"'
+    columns:
+      - name: STATUS
+        expr: .status // ""
+        emphasis: { complete: good, failed: bad, error: bad, active: warn, pending: warn }
+      - name: HOOK
+        expr: .upgradeJobHook // ""
+      - name: EVENT
+        expr: .event // ""
+    sort:
+      - by: HOOK
+      - by: EVENT
+    actions:
+      - key: enter
+        name: conditions
+        short: Show this job's conditions
+        open: upgrade.conditions
+        args:
+          job: $args.job
+
+  - id: upgrade.suspensions
+    title: Upgrade suspension windows
+    source:
+      script: |
+        kubectl -n appuio-openshift-upgrade-controller get UpgradeSuspensionWindow -o json
+    rows: .items[]
+    key: .metadata.name
+    columns:
+      - name: NAME
+        expr: .metadata.name
+      - name: STATE
+        expr: >-
+          (.spec.start | fromdateiso8601) as $s
+          | (.spec.end | fromdateiso8601) as $e
+          | if now >= $s and now < $e then "ACTIVE"
+            elif now < $s then "upcoming"
+            else "past" end
+        emphasis: { ACTIVE: bad, upcoming: warn }
+      - name: START
+        expr: .spec.start
+        format: timestamp
+      - name: END
+        expr: .spec.end
+        format: timestamp
+      - name: FOR
+        expr: >-
+          (((.spec.end | fromdateiso8601) - (.spec.start | fromdateiso8601)) / 60 | floor) as $m
+          | if $m >= 1440 then "\(($m / 1440 | floor))d\((($m % 1440) / 60 | floor))h"
+            elif $m >= 60 then "\(($m / 60 | floor))h\($m % 60)m"
+            else "\($m)m" end
+      # Where it came from decides whether deleting it sticks.
+      - name: SOURCE
+        expr: >-
+          (.metadata.labels // {}) as $l
+          | if $l["argocd.argoproj.io/instance"] then "argocd"
+            elif $l["app.kubernetes.io/managed-by"] == "rincewind" then "rincewind"
+            else "-" end
+      - name: REASON
+        expr: .spec.reason // ""
+    # A window in force right now is pinned to the top: that is the question
+    # this view exists to answer.
+    sort:
+      - by: STATE
+        rank: [ACTIVE, upcoming, past]
+      - by: START
+        order: desc
+    actions:
+      # Creates something, so it acts on no row — and asks for what it needs
+      # before it can show what it would run. Times are parsed in jq: the
+      # `date` command's flags differ between GNU and BSD, jq's do not.
+      - key: n
+        name: create
+        short: Create an upgrade suspension
+        scope: none
+        params:
+          - name: name
+            short: suspension name, lower-case letters, digits and dashes
+            required: true
+          - name: reason
+            short: why upgrades are suspended
+            required: true
+          - name: start
+            short: "start, e.g. 2026-05-25 09:00"
+            required: true
+          - name: end
+            short: "end, e.g. 2026-05-25 18:00, or +9h from the start"
+            required: true
+        # Wall clock is read in the machine's local zone, the way an operator
+        # means it. jq's strptime assumes UTC, so the offset is subtracted
+        # back out. Deriving these here rather than in the script means the
+        # resolved times are on screen before the create is confirmed.
+        env:
+          start_at: >-
+            ((now | localtime | mktime) - (now | floor)) as $off
+            | $args.start | sub(" "; "T") | strptime("%Y-%m-%dT%H:%M")
+            | mktime - $off | todate
+          end_at: >-
+            ((now | localtime | mktime) - (now | floor)) as $off
+            | ($args.start | sub(" "; "T") | strptime("%Y-%m-%dT%H:%M") | mktime - $off) as $s
+            | (if ($args.end | startswith("+"))
+               then $s + (($args.end | ltrimstr("+") | rtrimstr("h") | tonumber) * 3600)
+               else ($args.end | sub(" "; "T") | strptime("%Y-%m-%dT%H:%M") | mktime - $off)
+               end) as $e
+            | if $e <= $s then error("the end is not after the start") else $e | todate end
+        confirm: >-
+          "Create upgrade suspension \($args.name)\n\n  reason: \($args.reason)"
+        script: |
+          # create, not apply: a name already taken should fail, not merge.
+          kubectl -n appuio-openshift-upgrade-controller --as system:admin create -f - <<EOF
+          apiVersion: managedupgrade.appuio.io/v1beta1
+          kind: UpgradeSuspensionWindow
+          metadata:
+            name: "$name"
+            labels:
+              app.kubernetes.io/managed-by: rincewind
+          spec:
+            start: "$start_at"
+            end: "$end_at"
+            reason: "$reason"
+            configSelector: {}
+            jobSelector: {}
+          EOF
+        reload: true
+
+      - key: d
+        name: delete
+        short: Delete this suspension window
+        confirm: >-
+          "Delete upgrade suspension \(map(.metadata.name) | join(", "))" +
+          (if any(.[]; (.metadata.labels // {})["argocd.argoproj.io/instance"] != null)
+           then "\n\nSome of these come from git; ArgoCD will recreate them on its next sync."
+           else "" end)
+        env:
+          name: .metadata.name
+        script: |
+          kubectl -n appuio-openshift-upgrade-controller --as system:admin \
+            delete UpgradeSuspensionWindow "$name"
+        reload: true
+
+  - id: upgrade.progress
+    title: Whether the cluster is upgrading, and what it is waiting on
+    source:
+      script: kubectl get clusterversion version -o json
+    # A headline built from the object, then the conditions verbatim. Both
+    # come out of the one document as a stream of row objects.
+    rows: >-
+      (.status.conditions // []) as $c
+      | ([$c[] | select(.type == "Progressing")][0]) as $prog
+      | ([$c[] | select(.type == "Failing")][0]) as $fail
+      | [ {when: "", what: "version", value: (.status.desired.version // ""), reason: "", message: ""},
+          {when: "", what: "channel", value: (.spec.channel // ""), reason: "", message: ""},
+          {when: "", what: "upgrade",
+           value: (if ($fail.status // "") == "True" then "blocked"
+                   elif ($prog.status // "") == "True" then "in progress"
+                   else "idle" end),
+           reason: "",
+           message: (if ($prog.status // "") == "True" then ($prog.message // "")
+                     else ($fail.message // "") end)} ]
+        + [ $c[] | {when: .lastTransitionTime, what: .type, value: .status,
+                    reason: (.reason // ""), message: (.message // "")} ]
+      | .[]
+    key: .what
+    columns:
+      - name: WHEN
+        expr: .when
+        format: timestamp
+      - name: WHAT
+        expr: .what
+      # Only the derived headline is coloured; the raw conditions stay plain,
+      # because True means opposite things on Available and on Failing.
+      - name: VALUE
+        expr: .value
+        emphasis: { blocked: bad, "in progress": warn }
+      - name: REASON
+        expr: .reason
+      - name: MESSAGE
+        expr: .message
+
+  # The controller that drives the node rollout. Followed, because a stuck
+  # pool is watched rather than read once; --tail brings enough of the past
+  # along that the window is not empty while nothing happens.
+  - id: upgrade.logs
+    title: machine-config-controller log
+    class: text
+    follow: true
+    source:
+      script: |
+        kubectl -n openshift-machine-config-operator logs -f \
+          deploy/machine-config-controller --since 3h

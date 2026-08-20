@@ -1,0 +1,262 @@
+# All things Alertmanager related.
+#
+# There is no HTTP path that keeps kubeconfig auth working, so amtool runs
+# inside the pod via exec — which makes this the one group whose reads
+# impersonate: pod/exec is a privileged verb either way. Note also that while
+# Alertmanager itself is down, this group is blind.
+
+views:
+  - id: alerts.firing
+    title: Firing alerts, silenced and inhibited ones included
+    refresh: 60s
+    source:
+      script: |
+        kubectl -n openshift-monitoring --as system:admin exec sts/alertmanager-main -- \
+          amtool --alertmanager.url=http://localhost:9093 alert query -o json
+    # amtool prints a bare JSON array, not a kubectl List — the stdout
+    # contract takes any JSON value, so this needs no wrapping.
+    #
+    # The first row is a verdict on the pipeline itself: Watchdog is the
+    # alert that always fires, so its absence means alerting may be dead and
+    # an empty list means nothing.
+    rows: >-
+      [ {fingerprint: "", pipeline: true,
+         alert: "pipeline",
+         state: (if any(.[]; .labels.alertname == "Watchdog") then "ok" else "broken" end),
+         severity: "", since: "", namespace: "",
+         summary: (if any(.[]; .labels.alertname == "Watchdog")
+                   then "the Watchdog alert is firing"
+                   else "the Watchdog alert is missing — alerting may be dead" end)} ]
+      + [ .[]
+          | {fingerprint, pipeline: false,
+             alert: .labels.alertname,
+             severity: (.labels.severity // "none"),
+             # Alertmanager calls both cases "suppressed"; which one it is
+             # decides whether someone already knows.
+             state: (if .status.state == "active" then "firing"
+                     elif .status.state == "suppressed" then
+                       (if ((.status.silencedBy // []) | length) > 0 then "silenced"
+                        elif ((.status.inhibitedBy // []) | length) > 0 then "inhibited"
+                        else "suppressed" end)
+                     else .status.state end),
+             since: .startsAt,
+             namespace: (.labels.namespace // ""),
+             summary: (.annotations.summary // .annotations.message
+                       // .annotations.description // "")} ]
+      | .[]
+    key: '"\(.alert)/\(.fingerprint)"'
+    columns:
+      - name: ALERT
+        expr: .alert
+      - name: SEVERITY
+        expr: .severity
+        emphasis: { critical: bad, warning: warn }
+      - name: STATE
+        expr: .state
+        emphasis: { broken: bad, ok: good, silenced: warn, inhibited: warn, suppressed: warn }
+      - name: SINCE
+        expr: .since
+        format: timestamp
+      - name: NAMESPACE
+        expr: .namespace
+      - name: SUMMARY
+        expr: .summary
+    sort:
+      - by: SEVERITY
+        rank: ["", critical, warning, none]
+      - by: SINCE
+        order: desc
+      - by: ALERT
+    actions:
+      - key: enter
+        name: detail
+        short: Show this alert in full
+        open: alerts.detail
+        args:
+          fingerprint: >-
+            if .pipeline then error("the pipeline row is a verdict, not an alert")
+            else .fingerprint end
+
+      # Matchers are derived, not typed: only alertname and namespace, and
+      # only where every selected alert agrees on the value. Silencing on a
+      # label the set does not share would mute more than was shown.
+      - key: s
+        name: silence
+        short: Silence the selected alerts
+        params:
+          - name: comment
+            short: why this is silenced
+            required: true
+          - name: until
+            short: "until when: wall clock, or +2h from now"
+            default: +2h
+        env:
+          matcher: '"alertname=\"\(.labels.alertname // .alert)\""'
+          end_at: >-
+            ((now | localtime | mktime) - (now | floor)) as $off
+            | if ($args.until | startswith("+"))
+              then now + (($args.until | ltrimstr("+") | rtrimstr("h") | tonumber) * 3600)
+              else ($args.until | sub(" "; "T") | strptime("%Y-%m-%dT%H:%M") | mktime - $off)
+              end
+            | todate
+        confirm: '"Silence \(map(.labels.alertname // .alert) | unique | join(", ")) until \($args.until)"'
+        script: |
+          kubectl -n openshift-monitoring --as system:admin exec sts/alertmanager-main -- \
+            amtool --alertmanager.url=http://localhost:9093 silence add \
+              --author "${USER:-rincewind}" --comment "$comment" --end "$end_at" "$matcher"
+        reload: true
+
+  - id: alerts.silences
+    title: "Silences: what is muted, by whom, until when"
+    source:
+      script: |
+        kubectl -n openshift-monitoring --as system:admin exec sts/alertmanager-main -- \
+          amtool --alertmanager.url=http://localhost:9093 silence query -o json
+    rows: .[]
+    key: .id
+    columns:
+      # Eight characters is enough to tell them apart; the action uses the
+      # full id from the row.
+      - name: ID
+        expr: .id[0:8]
+      - name: STATE
+        expr: if .status.state == "active" then "ACTIVE" else .status.state end
+        emphasis: { ACTIVE: warn }
+      - name: START
+        expr: .startsAt
+        format: timestamp
+      - name: END
+        expr: .endsAt
+        format: timestamp
+      - name: CREATOR
+        expr: .createdBy // ""
+      - name: MATCHERS
+        expr: >-
+          [ .matchers[]?
+            | (if .isRegex and ((.isEqual == null) or .isEqual) then "=~"
+               elif .isRegex then "!~"
+               elif (.isEqual != null) and (.isEqual | not) then "!="
+               else "=" end) as $op
+            | "\(.name)\($op)\"\(.value)\"" ]
+          | join(" ")
+      - name: COMMENT
+        expr: .comment // ""
+    # A silence in force is masking something, so it is pinned to the top.
+    sort:
+      - by: STATE
+        rank: [ACTIVE, pending, expired]
+      - by: START
+        order: desc
+    actions:
+      # Sending an already-expired id fails the whole call, so those rows
+      # refuse rather than take the run down with them.
+      # `x` closes a tab, so expire takes `e`.
+      - key: e
+        name: expire
+        short: Expire this silence
+        confirm: '"Expire silence \(map(.id[0:8]) | join(", "))"'
+        env:
+          id: >-
+            if .status.state == "expired"
+            then error("silence \(.id[0:8]) has already expired")
+            else .id end
+        script: |
+          kubectl -n openshift-monitoring --as system:admin exec sts/alertmanager-main -- \
+            amtool --alertmanager.url=http://localhost:9093 silence expire "$id"
+        reload: true
+
+      # Each matcher becomes one argv element, verbatim, for amtool to parse:
+      # there is no second matcher grammar here to keep in sync with theirs.
+      - key: n
+        name: create
+        short: Create a silence from explicit matchers
+        scope: none
+        params:
+          - name: matchers
+            short: 'comma-separated, amtool syntax: alertname="Foo",namespace=~"syn.*"'
+            required: true
+          - name: comment
+            short: why this is silenced
+            required: true
+          - name: until
+            short: "until when: wall clock, or +2h from now"
+            default: +2h
+        env:
+          end_at: >-
+            ((now | localtime | mktime) - (now | floor)) as $off
+            | if ($args.until | startswith("+"))
+              then now + (($args.until | ltrimstr("+") | rtrimstr("h") | tonumber) * 3600)
+              else ($args.until | sub(" "; "T") | strptime("%Y-%m-%dT%H:%M") | mktime - $off)
+              end
+            | todate
+        confirm: '"Silence \($args.matchers) until \($args.until)"'
+        script: |
+          IFS=, read -r a b c d <<EOF
+          $matchers
+          EOF
+          set --
+          for m in "$a" "$b" "$c" "$d"; do
+            [ -n "$m" ] && set -- "$@" "$m"
+          done
+          kubectl -n openshift-monitoring --as system:admin exec sts/alertmanager-main -- \
+            amtool --alertmanager.url=http://localhost:9093 silence add \
+              --author "${USER:-rincewind}" --comment "$comment" --end "$end_at" "$@"
+        reload: true
+
+  - id: alerts.detail
+    title: "One alert in full: every label and annotation"
+    params:
+      - name: fingerprint
+        short: alert fingerprint, as the firing view carries it
+        required: true
+    source:
+      script: |
+        kubectl -n openshift-monitoring --as system:admin exec sts/alertmanager-main -- \
+          amtool --alertmanager.url=http://localhost:9093 alert query -o json
+    rows: >-
+      ([.[] | select(.fingerprint == $args.fingerprint)][0]) as $a
+      | if $a == null then error("no alert with fingerprint \($args.fingerprint)") else . end
+      | [ {what: "alert",  value: $a.labels.alertname},
+          {what: "state",  value: $a.status.state},
+          {what: "since",  value: $a.startsAt} ]
+        + [ $a.labels     | to_entries[] | {what: "label \(.key)",      value: .value} ]
+        + [ $a.annotations | to_entries[] | {what: "annotation \(.key)", value: .value} ]
+        + [ ($a.status.silencedBy // [])[] | {what: "silenced by",      value: .} ]
+      | .[]
+    key: .what
+    columns:
+      - name: WHAT
+        expr: .what
+      - name: VALUE
+        expr: .value
+        emphasis: { critical: bad, warning: warn, active: warn, suppressed: warn }
+    actions:
+      - key: s
+        name: silence
+        short: Silence this alert
+        scope: none
+        params:
+          - name: comment
+            short: why this is silenced
+            required: true
+          - name: until
+            short: "until when: wall clock, or +2h from now"
+            default: +2h
+        env:
+          end_at: >-
+            ((now | localtime | mktime) - (now | floor)) as $off
+            | if ($args.until | startswith("+"))
+              then now + (($args.until | ltrimstr("+") | rtrimstr("h") | tonumber) * 3600)
+              else ($args.until | sub(" "; "T") | strptime("%Y-%m-%dT%H:%M") | mktime - $off)
+              end
+            | todate
+        confirm: '"Silence the alert with fingerprint \($args.fingerprint) until \($args.until)"'
+        script: |
+          alert=$(kubectl -n openshift-monitoring --as system:admin exec sts/alertmanager-main -- \
+            amtool --alertmanager.url=http://localhost:9093 alert query -o json \
+            | jq -r --arg f "$fingerprint" '[.[] | select(.fingerprint == $f)][0].labels.alertname')
+          kubectl -n openshift-monitoring --as system:admin exec sts/alertmanager-main -- \
+            amtool --alertmanager.url=http://localhost:9093 silence add \
+              --author "${USER:-rincewind}" --comment "$comment" --end "$end_at" \
+              "alertname=\"$alert\""
+        reload: true

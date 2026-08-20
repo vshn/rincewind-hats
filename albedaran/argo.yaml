@@ -1,0 +1,165 @@
+# All things ArgoCD related. Reads run as whoever is logged in; mutations
+# impersonate, because changing an Application needs rights an operator does
+# not carry around day to day.
+
+views:
+  - id: argo.apps
+    title: ArgoCD applications and their sync state
+    refresh: 30s
+    source:
+      script: kubectl -n syn get applications.argoproj.io -o json
+    rows: .items[]
+    key: .metadata.name
+    columns:
+      - name: NAME
+        expr: .metadata.name
+      - name: SYNC
+        expr: .status.sync.status // "Unknown"
+        emphasis: { Synced: good, OutOfSync: bad, Unknown: warn }
+      - name: HEALTH
+        expr: .status.health.status // "Unknown"
+        emphasis: { Healthy: good, Degraded: bad, Missing: bad, Progressing: warn, Suspended: warn, Unknown: warn }
+      # An application whose automation is off will not heal itself, which is
+      # worth shouting about rather than leaving blank.
+      - name: AUTO
+        expr: if (.spec.syncPolicy.automated // null) != null then "on" else "PAUSED" end
+        emphasis: { PAUSED: warn }
+      - name: REVISION
+        expr: (.status.sync.revision // "")[0:7]
+      # The health message when there is one, else the first condition that
+      # has something to say — which is where a failed sync shows up.
+      - name: MESSAGE
+        expr: >-
+          .status.health.message //
+          ([.status.conditions[]? | select((.message // "") != "")][0]
+           | if . == null then "" else "\(.type): \(.message)" end)
+    # Trouble first: unsynced before unhealthy before fine. Those are the
+    # rows the view is opened for.
+    sort:
+      - by: SYNC
+        rank: [OutOfSync, Unknown, Synced]
+      - by: HEALTH
+        rank: [Degraded, Missing, Progressing, Suspended, Unknown, Healthy]
+      - by: NAME
+    actions:
+      - key: enter
+        name: resources
+        short: Show this application's resources
+        open: argo.syncstatus
+        args:
+          app: .metadata.name
+
+      - key: l
+        name: logs
+        short: Show controller log lines about this application
+        open: argo.logs
+        args:
+          app: .metadata.name
+
+      # The app-of-apps reverts a pause on its next sync, so it has to be
+      # paused too. The old tool did that silently; saying it and letting the
+      # operator select root is the same result without the hidden mutation.
+      - key: p
+        name: pause
+        short: Pause auto-sync
+        confirm: '"Pause auto-sync on \(map(.metadata.name) | join(", "))"'
+        env:
+          app: .metadata.name
+        script: |
+          kubectl -n syn --as system:admin patch applications.argoproj.io root \
+            --type merge -p '{"spec":{"syncPolicy":{"automated":null}}}'
+          kubectl -n syn --as system:admin patch applications.argoproj.io "$app" \
+            --type merge -p '{"spec":{"syncPolicy":{"automated":null}}}'
+        reload: true
+
+      # Nothing records what the policy was, so this sets the default rather
+      # than restoring the old block. Read-modify-write, if it earns its keep.
+      - key: P
+        name: unpause
+        short: Restore auto-sync (prune, selfHeal)
+        confirm: '"Set auto-sync (prune, selfHeal) on \(map(.metadata.name) | join(", "))"'
+        env:
+          app: .metadata.name
+        script: |
+          kubectl -n syn --as system:admin patch applications.argoproj.io "$app" \
+            --type merge -p '{"spec":{"syncPolicy":{"automated":{"prune":true,"selfHeal":true}}}}'
+        reload: true
+
+      - key: R
+        name: refresh
+        short: Ask ArgoCD to reconcile now
+        env:
+          app: .metadata.name
+        script: |
+          kubectl -n syn --as system:admin annotate applications.argoproj.io "$app" \
+            argocd.argoproj.io/refresh=normal --overwrite
+        reload: true
+
+  # Reached by drilling in from apps: without an application it has nothing
+  # to show, which is why `app` is required and this view is not listed.
+  - id: argo.syncstatus
+    title: One application's resources and their sync state
+    params:
+      - name: app
+        short: application name
+        required: true
+    source:
+      script: kubectl -n syn get applications.argoproj.io "$app" -o json
+    rows: .status.resources[]?
+    key: '"\(.kind)/\(.namespace // "")/\(.name)"'
+    columns:
+      - name: STATUS
+        expr: .status // "Unknown"
+        emphasis: { Synced: good, OutOfSync: bad, Unknown: warn }
+      - name: KIND
+        expr: .kind
+      - name: NAMESPACE/NAME
+        expr: if (.namespace // "") == "" then .name else "\(.namespace)/\(.name)" end
+      # ArgoCD omits the health of resources it does not track, so an empty
+      # status means healthy here — not unknown.
+      - name: HEALTH
+        expr: .health.status // ""
+        emphasis: { Healthy: good, Degraded: bad, Missing: bad, Progressing: warn, Suspended: warn }
+      - name: MESSAGE
+        expr: .health.message // ""
+    sort:
+      - by: STATUS
+        rank: [OutOfSync, Unknown, Synced]
+      - by: KIND
+      - by: NAMESPACE/NAME
+    actions:
+      - key: l
+        name: logs
+        short: Show controller log lines about this application
+        open: argo.logs
+        args:
+          app: $args.app
+
+      # The rows here are resources, so the application comes from the view's
+      # own parameter rather than from the row under the cursor.
+      - key: R
+        name: refresh
+        short: Ask ArgoCD to reconcile this application now
+        scope: none
+        script: |
+          kubectl -n syn --as system:admin annotate applications.argoproj.io "$app" \
+            argocd.argoproj.io/refresh=normal --overwrite
+        reload: true
+
+  # The application controller logs everything for every application at once,
+  # so the only way to read it is filtered down to one. grep, not jq: these
+  # are lines, not JSON. --line-buffered, because a pipe makes grep hold its
+  # output back in 4k blocks, and a followed log delivered in blocks is a
+  # followed log that looks stuck.
+  - id: argo.logs
+    title: Controller log lines about one application
+    class: text
+    follow: true
+    params:
+      - name: app
+        short: application name
+        required: true
+    source:
+      script: |
+        kubectl -n syn logs -f sts/syn-argocd-application-controller --tail 5000 \
+          | { grep --line-buffered -F "$app" || true; }

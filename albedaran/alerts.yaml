@@ -20,13 +20,13 @@ views:
     # alert that always fires, so its absence means alerting may be dead and
     # an empty list means nothing.
     rows: >-
-      [ {fingerprint: "", pipeline: true,
-         alert: "pipeline",
-         state: (if any(.[]; .labels.alertname == "Watchdog") then "ok" else "broken" end),
-         severity: "", since: "", namespace: "",
-         summary: (if any(.[]; .labels.alertname == "Watchdog")
-                   then "the Watchdog alert is firing"
-                   else "the Watchdog alert is missing — alerting may be dead" end)} ]
+      any(.[]; .labels.alertname == "Watchdog") as $wd
+      | [ {fingerprint: "", pipeline: true,
+           alert: "pipeline",
+           state: (if $wd then "ok" else "broken" end),
+           severity: "", since: "", namespace: "",
+           summary: (if $wd then "the Watchdog alert is firing"
+                     else "the Watchdog alert is missing — alerting may be dead" end)} ]
       + [ .[]
           | {fingerprint, pipeline: false,
              alert: .labels.alertname,
@@ -88,18 +88,40 @@ views:
             short: why this is silenced
             required: true
           - name: until
-            short: "until when: wall clock, or +2h from now"
+            short: "until when: +90m, +2h, +1d6h, or 2026-05-25 18:00"
             default: +2h
         env:
-          matcher: '"alertname=\"\(.labels.alertname // .alert)\""'
-          end_at: >-
-            ((now | localtime | mktime) - (now | floor)) as $off
-            | if ($args.until | startswith("+"))
-              then now + (($args.until | ltrimstr("+") | rtrimstr("h") | tonumber) * 3600)
-              else ($args.until | sub(" "; "T") | strptime("%Y-%m-%dT%H:%M") | mktime - $off)
-              end
-            | todate
-        confirm: '"Silence \(map(.labels.alertname // .alert) | unique | join(", ")) until \($args.until)"'
+          # The same refusal enter makes: the pipeline row is not an alert,
+          # and a silence on alertname="pipeline" would mute nothing. The
+          # rows carry the name as .alert; they never carried .labels.
+          matcher: >-
+            if .pipeline then error("the pipeline row is a verdict, not an alert")
+            else "alertname=\"\(.alert)\"" end
+          # The same definitions as upgrade.suspensions' start_at — see the
+          # notes there on the minute flooring and the zone offset. Copied,
+          # because expressions cannot share definitions across views.
+          end_at: |-
+            def nowmin: (now | floor) - ((now | floor) % 60);
+            def utcoff($t): ($t | localtime | mktime) - $t;
+            def span:
+              if test("^[0-9]+[mhd]([0-9]+[mhd])*$") | not
+              then error("\"\(.)\" is not a span; use m, h or d — 90m, 9h, 2d or 1d6h")
+              else [ match("([0-9]+)([mhd])"; "g")
+                     | (.captures[0].string | tonumber)
+                       * ({"m": 60, "h": 3600, "d": 86400}[.captures[1].string]) ]
+                   | add
+              end;
+            def moment($base):
+              (ascii_downcase | sub("^ +"; "") | sub(" +$"; "")) as $t
+              | if $t == "now" then nowmin
+                elif ($t | startswith("+")) then $base + ($t | ltrimstr("+") | span)
+                else (try ($t | sub(" "; "T") | strptime("%Y-%m-%dT%H:%M") | mktime)
+                      catch error("\"\($t)\" is not a time; use +90m, +2h, +1d6h or 2026-05-25 18:00")) as $naive
+                     | ($naive - utcoff($naive)) as $guess
+                     | $naive - utcoff($guess)
+                end;
+            $args.until | moment(nowmin) | todate
+        confirm: '"Silence \(map(.alert) | unique | join(", ")) until \($args.until)"'
         script: |
           kubectl -n openshift-monitoring --as system:admin exec sts/alertmanager-main -- \
             amtool --alertmanager.url=http://localhost:9093 silence add \
@@ -179,23 +201,44 @@ views:
             short: why this is silenced
             required: true
           - name: until
-            short: "until when: wall clock, or +2h from now"
+            short: "until when: +90m, +2h, +1d6h, or 2026-05-25 18:00"
             default: +2h
         env:
-          end_at: >-
-            ((now | localtime | mktime) - (now | floor)) as $off
-            | if ($args.until | startswith("+"))
-              then now + (($args.until | ltrimstr("+") | rtrimstr("h") | tonumber) * 3600)
-              else ($args.until | sub(" "; "T") | strptime("%Y-%m-%dT%H:%M") | mktime - $off)
-              end
-            | todate
+          # The same definitions as upgrade.suspensions' start_at — see the
+          # notes there on the minute flooring and the zone offset. Copied,
+          # because expressions cannot share definitions across views.
+          end_at: |-
+            def nowmin: (now | floor) - ((now | floor) % 60);
+            def utcoff($t): ($t | localtime | mktime) - $t;
+            def span:
+              if test("^[0-9]+[mhd]([0-9]+[mhd])*$") | not
+              then error("\"\(.)\" is not a span; use m, h or d — 90m, 9h, 2d or 1d6h")
+              else [ match("([0-9]+)([mhd])"; "g")
+                     | (.captures[0].string | tonumber)
+                       * ({"m": 60, "h": 3600, "d": 86400}[.captures[1].string]) ]
+                   | add
+              end;
+            def moment($base):
+              (ascii_downcase | sub("^ +"; "") | sub(" +$"; "")) as $t
+              | if $t == "now" then nowmin
+                elif ($t | startswith("+")) then $base + ($t | ltrimstr("+") | span)
+                else (try ($t | sub(" "; "T") | strptime("%Y-%m-%dT%H:%M") | mktime)
+                      catch error("\"\($t)\" is not a time; use +90m, +2h, +1d6h or 2026-05-25 18:00")) as $naive
+                     | ($naive - utcoff($naive)) as $guess
+                     | $naive - utcoff($guess)
+                end;
+            $args.until | moment(nowmin) | todate
         confirm: '"Silence \($args.matchers) until \($args.until)"'
+        # Split on commas without a word cap — `read a b c d` silently rode
+        # a fifth matcher along inside the fourth. set -f, because a matcher
+        # like namespace=~"syn.*" must not glob against the filesystem; the
+        # loop drops the empty words a stray comma leaves behind.
         script: |
-          IFS=, read -r a b c d <<EOF
-          $matchers
-          EOF
-          set --
-          for m in "$a" "$b" "$c" "$d"; do
+          set -f; IFS=,
+          set -- $matchers
+          unset IFS; set +f
+          for m in "$@"; do
+            shift
             [ -n "$m" ] && set -- "$@" "$m"
           done
           kubectl -n openshift-monitoring --as system:admin exec sts/alertmanager-main -- \
@@ -240,16 +283,33 @@ views:
             short: why this is silenced
             required: true
           - name: until
-            short: "until when: wall clock, or +2h from now"
+            short: "until when: +90m, +2h, +1d6h, or 2026-05-25 18:00"
             default: +2h
         env:
-          end_at: >-
-            ((now | localtime | mktime) - (now | floor)) as $off
-            | if ($args.until | startswith("+"))
-              then now + (($args.until | ltrimstr("+") | rtrimstr("h") | tonumber) * 3600)
-              else ($args.until | sub(" "; "T") | strptime("%Y-%m-%dT%H:%M") | mktime - $off)
-              end
-            | todate
+          # The same definitions as upgrade.suspensions' start_at — see the
+          # notes there on the minute flooring and the zone offset. Copied,
+          # because expressions cannot share definitions across views.
+          end_at: |-
+            def nowmin: (now | floor) - ((now | floor) % 60);
+            def utcoff($t): ($t | localtime | mktime) - $t;
+            def span:
+              if test("^[0-9]+[mhd]([0-9]+[mhd])*$") | not
+              then error("\"\(.)\" is not a span; use m, h or d — 90m, 9h, 2d or 1d6h")
+              else [ match("([0-9]+)([mhd])"; "g")
+                     | (.captures[0].string | tonumber)
+                       * ({"m": 60, "h": 3600, "d": 86400}[.captures[1].string]) ]
+                   | add
+              end;
+            def moment($base):
+              (ascii_downcase | sub("^ +"; "") | sub(" +$"; "")) as $t
+              | if $t == "now" then nowmin
+                elif ($t | startswith("+")) then $base + ($t | ltrimstr("+") | span)
+                else (try ($t | sub(" "; "T") | strptime("%Y-%m-%dT%H:%M") | mktime)
+                      catch error("\"\($t)\" is not a time; use +90m, +2h, +1d6h or 2026-05-25 18:00")) as $naive
+                     | ($naive - utcoff($naive)) as $guess
+                     | $naive - utcoff($guess)
+                end;
+            $args.until | moment(nowmin) | todate
         confirm: '"Silence the alert with fingerprint \($args.fingerprint) until \($args.until)"'
         script: |
           alert=$(kubectl -n openshift-monitoring --as system:admin exec sts/alertmanager-main -- \

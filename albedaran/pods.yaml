@@ -274,8 +274,10 @@ views:
   - id: pods.pdbreport
     title: Pod disruption budgets, written up for a ticket
     params:
+      # One legal value. The param earns its keep by being required — that
+      # is what keeps the view out of the menu.
       - name: include
-        short: problems or all
+        short: problems, the only value
         required: true
     class: text
     # Markdown, because Jira Cloud stores issues as ADF and takes Markdown on
@@ -283,12 +285,11 @@ views:
     # editor refuses, and it is not written here: this hat wears one hat.
     source:
       script: |
-        case "$include" in problems|all) ;;
-          *) echo "include takes problems or all, not \"$include\"" >&2; exit 1 ;;
+        case "$include" in problems) ;;
+          *) echo "include takes problems, not \"$include\"" >&2; exit 1 ;;
         esac
 
         kubectl get poddisruptionbudgets -A -o json | jq -r \
-          --arg include "$include" \
           --arg cluster "$(kubectl config current-context)" \
           --arg taken "$(date -u '+%Y-%m-%d %H:%M UTC')" '
           def budget:
@@ -322,8 +323,8 @@ views:
                 allowed: (.status.disruptionsAllowed // 0),
                 state: state,
                 since: (([.status.conditions[]?.lastTransitionTime] | sort | last) | when),
-                message: ([.status.conditions[]? | select((.message // "") != "")][0].message // "") } ] as $all
-          | ($all | if $include == "problems" then map(select(.state != "ok")) else . end) as $rows
+                message: ([.status.conditions[]? | select((.message // "") != "")][0].message // "") }
+            | select(.state != "ok") ] as $rows
           | ["Namespace", "Name", "Budget", "Healthy", "Allowed", "State", "Since"] as $head
 
           | "## Problem",

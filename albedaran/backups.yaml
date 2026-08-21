@@ -84,6 +84,7 @@ views:
         short: Show this object's conditions
         open: backups.conditions
         args:
+          namespace: .metadata.namespace
           kind: .kind
           name: .metadata.name
 
@@ -187,6 +188,7 @@ views:
         short: Show this object's conditions
         open: backups.conditions
         args:
+          namespace: .metadata.namespace
           kind: .kind
           name: .metadata.name
 
@@ -220,6 +222,12 @@ views:
   - id: backups.conditions
     title: One k8up object's conditions, as the operator wrote them
     params:
+      # Required, because both backup namespaces drill into this one view —
+      # a hardcoded namespace would answer the etcd view with the object
+      # backup's objects.
+      - name: namespace
+        short: the namespace the k8up object lives in
+        required: true
       - name: kind
         short: "k8up kind: Backup, Check, Prune or Restore"
         required: true
@@ -232,7 +240,7 @@ views:
       # carries it capitalised ("Prune"), the API group wants it lower.
       script: |
         k=$(printf %s "$kind" | tr '[:upper:]' '[:lower:]')
-        kubectl -n syn-cluster-backup get "$k.k8up.io" "$name" -o json
+        kubectl -n "$namespace" get "$k.k8up.io" "$name" -o json
     # started and finished are not conditions, but they are the only thing
     # that speaks for an object k8up has not written a condition for yet.
     rows: >-

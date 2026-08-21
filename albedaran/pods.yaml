@@ -229,6 +229,17 @@ views:
       # kubectl takes it — matchLabels as k=v, matchExpressions as the
       # set-based forms — and an empty selector stays empty, which is exactly
       # what it means: every pod in the namespace.
+      # `j` is taken by the cursor, so the ticket gets `t`. No selection to
+      # honour: a navigating action only ever sees the row under the cursor,
+      # and the report is about the cluster rather than about a row — it
+      # filters itself down to the budgets with something to say.
+      - key: t
+        name: report
+        short: Write the budgets in the way up for a ticket
+        open: pods.pdbreport
+        args:
+          include: '"problems"'
+
       - key: enter
         name: pods
         short: Show the pods this budget counts
@@ -249,3 +260,87 @@ views:
                   elif .operator == "DoesNotExist" then "!\(.key)"
                   else error("selector operator \(.operator) is not one kubectl -l can take") end))
             | join(",")
+
+  # The same table as pods.pdb, written for somewhere else: a ticket. Not
+  # listed, because `include` is required — a view that needs a parameter
+  # cannot be started from the menu, which is how a hat hides one.
+  #
+  # No refresh: a report carries the moment it was taken, and one that
+  # rewrote itself under the cursor would make that line a lie.
+  #
+  # The verdict below is pods.pdb's, said again. There is no way for one view
+  # to borrow another's expression, and a report that disagreed with the
+  # table it came from would be worse than the repetition.
+  - id: pods.pdbreport
+    title: Pod disruption budgets, written up for a ticket
+    params:
+      - name: include
+        short: problems or all
+        required: true
+    class: text
+    # Markdown, because Jira Cloud stores issues as ADF and takes Markdown on
+    # paste. Wiki markup is what Data Center speaks and what the new cloud
+    # editor refuses, and it is not written here: this hat wears one hat.
+    source:
+      script: |
+        case "$include" in problems|all) ;;
+          *) echo "include takes problems or all, not \"$include\"" >&2; exit 1 ;;
+        esac
+
+        kubectl get poddisruptionbudgets -A -o json | jq -r \
+          --arg include "$include" \
+          --arg cluster "$(kubectl config current-context)" \
+          --arg taken "$(date -u '+%Y-%m-%d %H:%M UTC')" '
+          def budget:
+            if .spec.minAvailable != null then "min \(.spec.minAvailable)"
+            elif .spec.maxUnavailable != null then "max \(.spec.maxUnavailable)"
+            else "none" end;
+          def state:
+            (.status // {}) as $s
+            | ($s.expectedPods // 0) as $expected
+            | ($s.currentHealthy // 0) as $healthy
+            | if any($s.conditions[]?; .reason == "SyncFailed") then "SyncFailed"
+              elif ($s.observedGeneration // 0) != (.metadata.generation // 0) then "stale"
+              elif $expected == 0 then "selects nothing"
+              elif ($s.disruptionsAllowed // 0) > 0 then "ok"
+              elif $healthy >= $expected then "unsatisfiable"
+              else "blocks drain" end;
+          # The same shortening the timestamp format does in the table, so
+          # a report and the view it came from say the time alike. (No
+          # apostrophes in here: the whole program is one shell-quoted
+          # string, and one would end it.)
+          def when:
+            (. // "") | if . == "" then "" else (.[0:16] | sub("T"; " ")) end;
+          # A newline or a pipe in a message would end the row it sits in.
+          def cell:
+            (. // "" | tostring) | gsub("[\r\n]+"; " ") | gsub("\\|"; "\\|");
+          def row($cells): "| " + ($cells | map(cell) | join(" | ")) + " |";
+
+          [ .items[]
+            | { ns: .metadata.namespace, name: .metadata.name, budget: budget,
+                healthy: "\(.status.currentHealthy // 0)/\(.status.expectedPods // 0)",
+                allowed: (.status.disruptionsAllowed // 0),
+                state: state,
+                since: (([.status.conditions[]?.lastTransitionTime] | sort | last) | when),
+                message: ([.status.conditions[]? | select((.message // "") != "")][0].message // "") } ] as $all
+          | ($all | if $include == "problems" then map(select(.state != "ok")) else . end) as $rows
+          | ["Namespace", "Name", "Budget", "Healthy", "Allowed", "State", "Since"] as $head
+
+          | "## Problem",
+            "",
+            "* Cluster: \($cluster)",
+            "* Timestamp: \($taken)",
+            "",
+            "The following pod disruption budgets are invalid and may block the next maintenance.",
+            "",
+            ( if ($rows | length) == 0
+              then "No budget is in the way."
+              else row($head), row($head | map("---")),
+                   ( $rows[] | row([.ns, .name, .budget, .healthy, .allowed, .state, .since]) )
+              end ),
+            ( [$rows[] | select(.message != "")] as $noted
+              | if ($noted | length) == 0 then empty
+                else "", "### Messages", "",
+                     ($noted[] | "* \(.ns)/\(.name): \(.message | cell)")
+                end )
+          '

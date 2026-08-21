@@ -1,0 +1,60 @@
+# All things Loki related. The LokiStack keeps its whole account of itself in
+# status.conditions: whether the stack came up, and if not, which component
+# is holding it back.
+
+views:
+  # The old `aldedigger loki syncstatus` printed only the conditions standing
+  # at True, which is what is in force. The ones at False are kept here
+  # anyway — that Failed is False is exactly the reassurance one came for —
+  # and told apart by colour rather than by being thrown away.
+  - id: loki.status
+    title: The LokiStack's own account of whether it came up
+    refresh: 30s
+    params:
+      # There is one stack per cluster in practice, but the name is spec, not
+      # law, so it is asked for rather than baked into the script.
+      - name: stack
+        short: LokiStack name
+        default: loki
+    source:
+      script: kubectl -n openshift-logging get lokistack "$stack" -o json
+    rows: .status.conditions[]?
+    key: .type
+    columns:
+      - name: SINCE
+        expr: .lastTransitionTime // ""
+        format: timestamp
+      # Type and status fold into one word, because neither says anything
+      # alone: True is good on Ready and bad on Failed, so a colour on the
+      # status would have to read the type in the cell beside it. Folded,
+      # each value carries its own verdict and can be coloured on its own.
+      - name: STATE
+        expr: >-
+          if .status == "True" then .type
+          elif .status == "False" then "not \(.type)"
+          else "\(.type) unknown" end
+        # Only what is in force is coloured, plus the one absence that is
+        # itself the alarm: a stack that is not Ready. The other negatives —
+        # not Failed, not Degraded — are the normal state of a healthy stack,
+        # and colouring them would paint the table for saying nothing.
+        emphasis:
+          { Ready: good, "not Ready": bad, "Ready unknown": warn,
+            Failed: bad, Degraded: bad, Pending: warn, Warning: warn }
+      - name: REASON
+        expr: .reason // ""
+      - name: MESSAGE
+        expr: .message // ""
+    # What is in force first; within that, the most recent transition at the
+    # bottom, so the newest thing to have happened is where reading ends.
+    sort:
+      - by: SINCE
+        order: asc
+    actions:
+      # A stack that is Pending or Degraded says so in one line; which pod is
+      # actually sulking is a namespace away.
+      - key: p
+        name: pods
+        short: Show unhealthy pods in the Loki namespace
+        open: pods.failed
+        args:
+          namespace: '"openshift-logging"'

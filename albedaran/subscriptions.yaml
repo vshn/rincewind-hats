@@ -1,0 +1,162 @@
+# The operators OLM installs and keeps up to date. A subscription says which
+# operator is wanted and from which channel; an install plan is the concrete
+# step from one version to the next — and a manual one waits for a human to
+# say yes, which is the whole reason this group exists.
+
+views:
+  - id: subscriptions.operators
+    title: OLM subscriptions and the operator version each one holds
+    refresh: 30s
+    source:
+      script: kubectl get subscriptions.operators.coreos.com -A -o json
+    rows: .items[]
+    key: '"\(.metadata.namespace)/\(.metadata.name)"'
+    columns:
+      - name: NAMESPACE
+        expr: .metadata.namespace
+      # A subscription made in the console is named after everything that went
+      # into it — package, channel, catalogue, catalogue namespace — which is
+      # sixty-five characters of a column every other row has to be padded
+      # out to. Where the name is exactly that concatenation, the package
+      # alone is shown: the parts dropped are the three columns beside it.
+      # Any other name is somebody's choice and is left as it stands.
+      - name: NAME
+        expr: >-
+          if .metadata.name == "\(.spec.name)-\(.spec.channel)-\(.spec.source)-\(.spec.sourceNamespace)"
+          then .spec.name
+          else .metadata.name end
+      - name: CHANNEL
+        expr: .spec.channel // ""
+      - name: APPROVAL
+        expr: .spec.installPlanApproval // ""
+      # status.state only ever says UpgradePending, whether OLM is busy
+      # installing or waiting for a human. The conditions know the
+      # difference, so the one case that needs a person is lifted out of
+      # them and given its own word.
+      - name: STATE
+        expr: >-
+          (.status // {}) as $s
+          | if any($s.conditions[]?;
+                   .type == "InstallPlanPending" and .status == "True"
+                   and .reason == "RequiresApproval")
+            then "RequiresApproval"
+            else ($s.state // "") end
+        emphasis:
+          { UpgradeFailed: bad, RequiresApproval: warn, UpgradePending: warn,
+            UpgradeAvailable: warn, AtLatestKnown: good }
+      - name: CSV
+        expr: .status.installedCSV // ""
+      # Empty while the installed version is the current one, which is most
+      # of the time. A version here is a version not running yet.
+      - name: AVAILABLE
+        expr: >-
+          (.status.currentCSV // "") as $cur
+          | if $cur == (.status.installedCSV // "") then "" else $cur end
+      - name: SINCE
+        expr: .status.lastUpdated // ""
+        format: timestamp
+      # Only conditions standing at True can be complaints, and only the ones
+      # carrying a message have something to add — OLM leaves it null on the
+      # conditions that are merely bookkeeping.
+      - name: MESSAGE
+        expr: >-
+          [.status.conditions[]? | select(.status == "True" and (.message // "") != "")][0]
+          | if . == null then "" else "\(.type): \(.message)" end
+    # Trouble first, and above all the row that is waiting for a person.
+    # Within a class the most recent change at the bottom.
+    sort:
+      - by: STATE
+        rank: [UpgradeFailed, RequiresApproval, UpgradePending, UpgradeAvailable, AtLatestKnown]
+      - by: SINCE
+    actions:
+      # The subscription names its plan; without one the drill-down falls
+      # back to every plan in the namespace, which is the next best answer.
+      - key: enter
+        name: installplan
+        short: Show the install plan this subscription is on
+        open: subscriptions.installplans
+        args:
+          namespace: .status.installPlanRef.namespace // .metadata.namespace
+          name: .status.installPlanRef.name // ""
+
+  # Listed as well as drilled into: without parameters it shows every plan,
+  # which is the view one opens to find out whether anything is waiting.
+  - id: subscriptions.installplans
+    title: OLM install plans and whether one is waiting to be approved
+    refresh: 30s
+    params:
+      - name: namespace
+        short: namespace, empty for all
+      - name: name
+        short: install plan name, empty for all
+    source:
+      # Filtering by name with --field-selector rather than naming the object
+      # keeps the output a list either way, so rows reads the same. The
+      # `if ... fi` is pods.failed's, and for the same reason: the && form
+      # leaves exit status 1 when the parameter is empty.
+      script: |
+        if [ -n "$name" ]; then set -- --field-selector "metadata.name=$name"; fi
+        if [ -n "$namespace" ]; then
+          kubectl -n "$namespace" get installplans "$@" -o json
+        else
+          kubectl get installplans -A "$@" -o json
+        fi
+    rows: .items[]
+    key: '"\(.metadata.namespace)/\(.metadata.name)"'
+    columns:
+      - name: NAMESPACE
+        expr: .metadata.namespace
+      - name: NAME
+        expr: .metadata.name
+      - name: PHASE
+        expr: .status.phase // ""
+        emphasis: { Failed: bad, RequiresApproval: warn, Installing: warn, Planning: warn, Complete: good }
+      # The approval mode alone says nothing — a Manual plan already approved
+      # is as finished as an automatic one. Folded together, the one value
+      # that means "waiting for you" can be coloured on its own.
+      - name: APPROVAL
+        expr: >-
+          if (.spec.approval // "") == "Automatic" then "Automatic"
+          elif (.spec.approved // false) then "Manual, approved"
+          else "Manual, pending" end
+        emphasis: { "Manual, pending": warn }
+      # A plan carries the dependencies it drags in, so this is a list.
+      - name: CSV
+        expr: (.spec.clusterServiceVersionNames // []) | join(", ")
+      # A plan awaiting approval has neither a condition nor a start time —
+      # only the day it was drawn up, which is exactly how long it has been
+      # waiting.
+      - name: SINCE
+        expr: >-
+          ([.status.conditions[]?.lastTransitionTime] | sort | last)
+          // .status.startTime // .metadata.creationTimestamp // ""
+        format: timestamp
+    # Trouble first, then what waits for a person; completed plans sink to
+    # the bottom, where they are archive. Within a class the most recent at
+    # the bottom.
+    sort:
+      - by: PHASE
+        rank: [Failed, RequiresApproval, Installing, Planning, Complete]
+      - by: SINCE
+    actions:
+      # `a` is taken by select-all, so approving is A — which suits it, the
+      # capital being what mutations wear in this hat. Work: it runs once per
+      # selected row, so approving several is selecting several.
+      - key: A
+        name: approve
+        short: Approve this install plan
+        confirm: >-
+          if any(.[]; (.spec.approval // "") != "Manual")
+          then error("an automatic plan is approved by OLM itself; there is nothing here to say yes to")
+          elif any(.[]; .spec.approved == true)
+          then error("already approved; what is left is OLM installing it")
+          else "Approve \(map("\(.metadata.namespace)/\(.metadata.name)") | join(", "))" +
+               "\n\nThis installs \(map(.spec.clusterServiceVersionNames // [] | join(", ")) | join("; "))."
+          end
+        env:
+          namespace: .metadata.namespace
+          name: .metadata.name
+        script: |
+          kubectl --as system:admin -n "$namespace" patch installplan "$name" \
+            --type merge -p '{"spec":{"approved":true}}'
+        reload: true

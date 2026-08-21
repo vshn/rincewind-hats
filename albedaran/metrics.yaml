@@ -1,0 +1,103 @@
+# CPU and memory per node over the last week, from the cluster's own Thanos.
+#
+# Why the queries aggregate per bucket: a bare query_range with a 30m step
+# *samples* — a spike between two steps never reaches the tool at all. So
+# each bucket carries its avg (the line that tells the trend) and its max
+# (the spikes one is looking for), via subqueries over the recording rule.
+# The max series go out first: script order is draw order, later on top.
+#
+# In the TUI, `/` narrows the chart to series whose name matches, and the
+# names are chosen so the filter doubles as a toggle: `/avg` hides the max
+# band, `/max` shows the spikes alone, a node name shows that node's pair,
+# and esc brings everything back. Display state is the filter's job — an
+# action either navigates or runs a script, and this is neither.
+#
+# The two views are deliberately spelled out rather than folded into one
+# parameterised view: a hat shows exactly what runs, and the interesting
+# difference — which rule, which fallback — would be the part hidden.
+#
+# Needs oc for the token, plus curl and jq, like the rest of this hat.
+
+views:
+  - id: nodes.cpu
+    title: CPU per node, one week, avg and max per 30m
+    class: chart
+    yrange: [0, 100]
+    params:
+      - name: selector
+        short: label selector, as kubectl -l takes it
+    source:
+      script: |
+        host=$(kubectl -n openshift-monitoring get route thanos-querier \
+          -o jsonpath='{.spec.host}')
+        token=$(oc whoami -t)
+        if [ -n "$selector" ]; then set -- -l "$selector"; fi
+        re=$(kubectl get nodes "$@" \
+          -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' \
+          | paste -sd'|' -)
+        # The recording rule's name changed across cluster versions; probe
+        # for the newer spelling and fall back to the older one.
+        rule=instance:node_cpu_utilisation:rate1m
+        n=$(curl -sf -G "https://$host/api/v1/query" \
+          -H "Authorization: Bearer $token" \
+          --data-urlencode "query=$rule" | jq '.data.result | length')
+        if [ "${n:-0}" -eq 0 ]; then rule=instance:node_cpu_utilisation:rate5m; fi
+        end=$(date +%s)
+        start=$((end - 7 * 24 * 3600))
+        q() {
+          curl -sf -G "https://$host/api/v1/query_range" \
+            -H "Authorization: Bearer $token" \
+            --data-urlencode "query=$1" \
+            --data-urlencode "start=$start" \
+            --data-urlencode "end=$end" \
+            --data-urlencode "step=1800" \
+          | jq -c --arg suffix "$2" \
+              '.data.result[] | {name: (.metric.instance + $suffix), points: .values}'
+        }
+        q "max_over_time(${rule}{instance=~\"$re\"}[30m:1m]) * 100" " max"
+        q "avg_over_time(${rule}{instance=~\"$re\"}[30m:1m]) * 100" " avg"
+    rows: .
+
+  - id: nodes.memory
+    title: Memory per node, one week, avg and max per 30m
+    class: chart
+    yrange: [0, 100]
+    params:
+      - name: selector
+        short: label selector, as kubectl -l takes it
+    source:
+      script: |
+        host=$(kubectl -n openshift-monitoring get route thanos-querier \
+          -o jsonpath='{.spec.host}')
+        token=$(oc whoami -t)
+        if [ -n "$selector" ]; then set -- -l "$selector"; fi
+        re=$(kubectl get nodes "$@" \
+          -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' \
+          | paste -sd'|' -)
+        # The memory ratio rule is a gauge, no rate suffix. Where a cluster
+        # lacks it, fall back to computing the same ratio from node_exporter.
+        rule=instance:node_memory_utilisation:ratio
+        n=$(curl -sf -G "https://$host/api/v1/query" \
+          -H "Authorization: Bearer $token" \
+          --data-urlencode "query=$rule" | jq '.data.result | length')
+        if [ "${n:-0}" -gt 0 ]; then
+          expr="${rule}{instance=~\"$re\"}"
+        else
+          expr="(1 - sum by (instance)(node_memory_MemAvailable_bytes{instance=~\"$re\"})
+                     / sum by (instance)(node_memory_MemTotal_bytes{instance=~\"$re\"}))"
+        fi
+        end=$(date +%s)
+        start=$((end - 7 * 24 * 3600))
+        q() {
+          curl -sf -G "https://$host/api/v1/query_range" \
+            -H "Authorization: Bearer $token" \
+            --data-urlencode "query=$1" \
+            --data-urlencode "start=$start" \
+            --data-urlencode "end=$end" \
+            --data-urlencode "step=1800" \
+          | jq -c --arg suffix "$2" \
+              '.data.result[] | {name: (.metric.instance + $suffix), points: .values}'
+        }
+        q "max_over_time((${expr})[30m:1m]) * 100" " max"
+        q "avg_over_time((${expr})[30m:1m]) * 100" " avg"
+    rows: .

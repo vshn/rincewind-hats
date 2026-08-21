@@ -204,6 +204,36 @@ views:
                   | map("\(.key)=\(.value)") | join(","))
             end
 
+      # The same selector, charted: CPU and memory per node in this pool
+      # over a week — c and C pair the way cordon and uncordon do above.
+      - key: t
+        name: cpu
+        short: Chart CPU per node in this pool, 1w
+        open: nodes.cpu
+        args:
+          selector: >-
+            if ((.spec.nodeSelector.matchExpressions // []) | length) > 0
+            then error("pool \(.metadata.name) selects nodes by expression, which this view cannot render; use kubectl")
+            elif ((.spec.nodeSelector.matchLabels // {}) | length) == 0
+            then error("pool \(.metadata.name) has no node selector")
+            else (.spec.nodeSelector.matchLabels | to_entries | sort_by(.key)
+                  | map("\(.key)=\(.value)") | join(","))
+            end
+
+      - key: T
+        name: memory
+        short: Chart memory per node in this pool, 1w
+        open: nodes.memory
+        args:
+          selector: >-
+            if ((.spec.nodeSelector.matchExpressions // []) | length) > 0
+            then error("pool \(.metadata.name) selects nodes by expression, which this view cannot render; use kubectl")
+            elif ((.spec.nodeSelector.matchLabels // {}) | length) == 0
+            then error("pool \(.metadata.name) has no node selector")
+            else (.spec.nodeSelector.matchLabels | to_entries | sort_by(.key)
+                  | map("\(.key)=\(.value)") | join(","))
+            end
+
       # Work: runs once per selected row. Select with ␣ or a first — a
       # mutation never acts on merely what the filter left.
       - key: p

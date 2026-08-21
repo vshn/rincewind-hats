@@ -95,6 +95,55 @@ views:
             argocd.argoproj.io/refresh=normal --overwrite
         reload: true
 
+      # The same annotation, one word louder: hard throws away the manifests
+      # ArgoCD has cached and renders them from the repository again. That is
+      # the one that helps when the catalog has moved on and a plain refresh
+      # keeps reporting the app as Synced against yesterday.
+      - key: H
+        name: hard-refresh
+        short: Hard refresh (re-render the manifests, ignoring the cache)
+        env:
+          app: .metadata.name
+        script: |
+          kubectl -n syn --as system:admin annotate applications.argoproj.io "$app" \
+            argocd.argoproj.io/refresh=hard --overwrite
+        reload: true
+
+      # There is no annotation for syncing: refresh only asks ArgoCD to look
+      # again, and on a paused application looking changes nothing. A sync is
+      # requested by writing the operation onto the Application, which is all
+      # the API server does when the Sync button is pressed. The user it is
+      # recorded under is the real one, not the impersonated admin.
+      - key: S
+        name: sync
+        short: Sync now, the way the app syncs itself
+        confirm: >-
+          "Sync \(map(if .spec.syncPolicy.automated.prune
+          then "\(.metadata.name) (with prune)" else .metadata.name end)
+          | join(", "))"
+        env:
+          app: .metadata.name
+        script: |
+          set -eu
+          # The application's own sync policy decides the operation, read now
+          # rather than taken from the row, so both views can run this and a
+          # row half a refresh old cannot decide what gets pruned. No revision
+          # goes in: left out, ArgoCD resolves the app's target revision
+          # itself, which is what asking for a sync now means.
+          app_json=$(kubectl -n syn get applications.argoproj.io "$app" -o json)
+          if printf '%s' "$app_json" | jq -e '.operation != null' >/dev/null; then
+            echo "$app is already syncing; let that finish first" >&2
+            exit 1
+          fi
+          patch=$(printf '%s' "$app_json" \
+            | jq -c --arg user "$(oc whoami 2>/dev/null || echo unknown)" \
+              '{operation: {initiatedBy: {username: $user},
+                            sync: {prune: (.spec.syncPolicy.automated.prune // false),
+                                   syncOptions: (.spec.syncPolicy.syncOptions // [])}}}')
+          kubectl -n syn --as system:admin patch applications.argoproj.io "$app" \
+            --type merge -p "$patch"
+        reload: true
+
   # Reached by drilling in from apps: without an application it has nothing
   # to show, which is why `app` is required and this view is not listed.
   - id: argo.syncstatus
@@ -144,6 +193,45 @@ views:
         script: |
           kubectl -n syn --as system:admin annotate applications.argoproj.io "$app" \
             argocd.argoproj.io/refresh=normal --overwrite
+        reload: true
+
+      # As in argo.apps: hard drops the cached manifests first.
+      - key: H
+        name: rerender
+        short: Hard refresh (re-render this application, ignoring the cache)
+        scope: none
+        script: |
+          kubectl -n syn --as system:admin annotate applications.argoproj.io "$app" \
+            argocd.argoproj.io/refresh=hard --overwrite
+        reload: true
+
+      # The same request as in argo.apps, kept in step with it word for word.
+      # The rows here are resources, so the application comes from the view's
+      # own parameter and the script reads its policy for itself.
+      - key: S
+        name: sync
+        short: Sync this application now
+        scope: none
+        confirm: '"Sync \($args.app) now"'
+        script: |
+          set -eu
+          # The application's own sync policy decides the operation, read now
+          # rather than taken from the row, so both views can run this and a
+          # row half a refresh old cannot decide what gets pruned. No revision
+          # goes in: left out, ArgoCD resolves the app's target revision
+          # itself, which is what asking for a sync now means.
+          app_json=$(kubectl -n syn get applications.argoproj.io "$app" -o json)
+          if printf '%s' "$app_json" | jq -e '.operation != null' >/dev/null; then
+            echo "$app is already syncing; let that finish first" >&2
+            exit 1
+          fi
+          patch=$(printf '%s' "$app_json" \
+            | jq -c --arg user "$(oc whoami 2>/dev/null || echo unknown)" \
+              '{operation: {initiatedBy: {username: $user},
+                            sync: {prune: (.spec.syncPolicy.automated.prune // false),
+                                   syncOptions: (.spec.syncPolicy.syncOptions // [])}}}')
+          kubectl -n syn --as system:admin patch applications.argoproj.io "$app" \
+            --type merge -p "$patch"
         reload: true
 
   # The application controller logs everything for every application at once,

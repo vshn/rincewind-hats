@@ -171,8 +171,8 @@ views:
       - name: SOURCE
         expr: >-
           (.metadata.labels // {}) as $l
-          | if $l["argocd.argoproj.io/instance"] then "argocd"
-            elif $l["app.kubernetes.io/managed-by"] == "rincewind" then "rincewind"
+          | if $l["argocd.argoproj.io/instance"] then $l["argocd.argoproj.io/instance"]
+            elif $l["app.kubernetes.io/managed-by"] then $l["app.kubernetes.io/managed-by"]
             else "-" end
       - name: REASON
         expr: .spec.reason // ""
@@ -199,27 +199,80 @@ views:
             short: why upgrades are suspended
             required: true
           - name: start
-            short: "start, e.g. 2026-05-25 09:00"
+            short: "start: now, +30m, +2d, or 2026-05-25 09:00"
+            default: now
             required: true
           - name: end
-            short: "end, e.g. 2026-05-25 18:00, or +9h from the start"
+            short: "end: +9h or +1d6h from the start, or 2026-05-25 18:00"
             required: true
-        # Wall clock is read in the machine's local zone, the way an operator
-        # means it. jq's strptime assumes UTC, so the offset is subtracted
-        # back out. Deriving these here rather than in the script means the
-        # resolved times are on screen before the create is confirmed.
+        # Both times are read by the same two definitions, so the start and
+        # the end accept the same spellings — `now`, a `+` span, or wall
+        # clock — and a span may be written in minutes, hours and days, in
+        # any combination: 90m, 9h, 2d, 1d6h.
+        #
+        # A span on the end counts from the start, which is what makes
+        # "+9h" mean a nine-hour window rather than nine hours from now.
+        #
+        # Deriving these here rather than in the script is what puts the
+        # resolved RFC 3339 on screen before the create is confirmed — a
+        # relative time is only safe if you can see what it worked out to.
+        #
+        # Times are parsed in jq because the `date` command's flags differ
+        # between GNU and BSD; jq's do not. Two things that look like detail
+        # and are not:
+        #
+        #   - `now` is floored to the minute, and so is what a span counts
+        #     from. `now` carries sub-second fractions, and an offset
+        #     carrying them lands one second before the intended minute — a
+        #     window that starts at 08:59:59.
+        #   - the zone offset is taken at the *target* instant, not at this
+        #     one. A window booked in August for December would otherwise be
+        #     an hour out, because the offset it was created under is not the
+        #     offset it will be read under.
         env:
-          start_at: >-
-            ((now | localtime | mktime) - (now | floor)) as $off
-            | $args.start | sub(" "; "T") | strptime("%Y-%m-%dT%H:%M")
-            | mktime - $off | todate
-          end_at: >-
-            ((now | localtime | mktime) - (now | floor)) as $off
-            | ($args.start | sub(" "; "T") | strptime("%Y-%m-%dT%H:%M") | mktime - $off) as $s
-            | (if ($args.end | startswith("+"))
-               then $s + (($args.end | ltrimstr("+") | rtrimstr("h") | tonumber) * 3600)
-               else ($args.end | sub(" "; "T") | strptime("%Y-%m-%dT%H:%M") | mktime - $off)
-               end) as $e
+          start_at: |-
+            def nowmin: (now | floor) - ((now | floor) % 60);
+            def utcoff($t): ($t | localtime | mktime) - $t;
+            def span:
+              if test("^[0-9]+[mhd]([0-9]+[mhd])*$") | not
+              then error("\"\(.)\" is not a span; use m, h or d — 90m, 9h, 2d or 1d6h")
+              else [ match("([0-9]+)([mhd])"; "g")
+                     | (.captures[0].string | tonumber)
+                       * ({"m": 60, "h": 3600, "d": 86400}[.captures[1].string]) ]
+                   | add
+              end;
+            def moment($base):
+              (ascii_downcase | sub("^ +"; "") | sub(" +$"; "")) as $t
+              | if $t == "now" then nowmin
+                elif ($t | startswith("+")) then $base + ($t | ltrimstr("+") | span)
+                else (try ($t | sub(" "; "T") | strptime("%Y-%m-%dT%H:%M") | mktime)
+                      catch error("\"\($t)\" is not a time; use now, +90m, +9h, +2d or 2026-05-25 09:00")) as $naive
+                     | ($naive - utcoff($naive)) as $guess
+                     | $naive - utcoff($guess)
+                end;
+            $args.start | moment(nowmin) | todate
+          end_at: |-
+            def nowmin: (now | floor) - ((now | floor) % 60);
+            def utcoff($t): ($t | localtime | mktime) - $t;
+            def span:
+              if test("^[0-9]+[mhd]([0-9]+[mhd])*$") | not
+              then error("\"\(.)\" is not a span; use m, h or d — 90m, 9h, 2d or 1d6h")
+              else [ match("([0-9]+)([mhd])"; "g")
+                     | (.captures[0].string | tonumber)
+                       * ({"m": 60, "h": 3600, "d": 86400}[.captures[1].string]) ]
+                   | add
+              end;
+            def moment($base):
+              (ascii_downcase | sub("^ +"; "") | sub(" +$"; "")) as $t
+              | if $t == "now" then nowmin
+                elif ($t | startswith("+")) then $base + ($t | ltrimstr("+") | span)
+                else (try ($t | sub(" "; "T") | strptime("%Y-%m-%dT%H:%M") | mktime)
+                      catch error("\"\($t)\" is not a time; use now, +90m, +9h, +2d or 2026-05-25 09:00")) as $naive
+                     | ($naive - utcoff($naive)) as $guess
+                     | $naive - utcoff($guess)
+                end;
+            ($args.start | moment(nowmin)) as $s
+            | ($args.end | moment($s)) as $e
             | if $e <= $s then error("the end is not after the start") else $e | todate end
         confirm: >-
           "Create upgrade suspension \($args.name)\n\n  reason: \($args.reason)"

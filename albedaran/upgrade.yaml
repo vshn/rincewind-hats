@@ -295,6 +295,137 @@ views:
       - name: MESSAGE
         expr: .message
 
+  # The ClusterOperators, folded to the two questions an upgrade asks of
+  # them: before it starts, "who blocks it" (Upgradeable False); while it
+  # runs, "who hangs" (Progressing, Degraded, or still on the old version).
+  # The "behind" verdict needs the ClusterVersion's target, so the script
+  # joins it in with jq, the way nodes.status joins pools — best effort, so
+  # the view keeps working when that one read fails. Needs jq on the PATH.
+  - id: upgrade.operators
+    title: ClusterOperators and where the upgrade finds them
+    refresh: 60s
+    source:
+      script: |
+        d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
+        kubectl get clusteroperators -o json > "$d/cos.json"
+        kubectl get clusterversion version -o json > "$d/cv.json" 2>/dev/null \
+          || echo '{}' > "$d/cv.json"
+        jq -s '
+          (.[1].status.desired.version // "") as $target
+          | .[0].items[]
+          | . + {target: $target}
+        ' "$d/cos.json" "$d/cv.json"
+    rows: .
+    key: .metadata.name
+    columns:
+      - name: NAME
+        expr: .metadata.name
+      # The three health conditions folded to one word, worst first: an
+      # operator that is gone outranks one that is merely struggling, and
+      # both outrank one that is busy. A missing or Unknown Available reads
+      # as Unavailable — an operator that cannot say it is there, is not.
+      - name: STATE
+        expr: >-
+          [.status.conditions[]? | select(.type == "Available")][0] as $a
+          | [.status.conditions[]? | select(.type == "Degraded")][0] as $d
+          | [.status.conditions[]? | select(.type == "Progressing")][0] as $p
+          | if ($a.status // "Unknown") != "True" then "Unavailable"
+            elif ($d.status // "") == "True" then "Degraded"
+            elif ($p.status // "") == "True" then "Progressing"
+            else "OK" end
+        emphasis: { Unavailable: bad, Degraded: bad, Progressing: warn, OK: good }
+      # The upgrade axis, apart from health: "blocked" answers why an
+      # upgrade will not start, "behind" says who it is still waiting on. A
+      # missing Upgradeable condition means upgradeable — only False blocks.
+      - name: UPGRADE
+        expr: >-
+          [.status.conditions[]? | select(.type == "Upgradeable")][0] as $u
+          | ([.status.versions[]? | select(.name == "operator")][0].version // "") as $v
+          | if ($u.status // "") == "False" then "blocked"
+            elif .target != "" and $v != "" and $v != .target then "behind"
+            else "" end
+        emphasis: { blocked: warn, behind: warn }
+      # Plain, deliberately: the verdict on the version already sits in
+      # UPGRADE, and an emphasis map cannot match a moving version string.
+      - name: VERSION
+        expr: '[.status.versions[]? | select(.name == "operator")][0].version // ""'
+      # The newest transition of any condition: while the upgrade moves this
+      # is the last sign of life, afterwards it lines up against the logs —
+      # which an age like "4h59m" cannot.
+      - name: SINCE
+        expr: '([.status.conditions[]?.lastTransitionTime] | sort | last) // ""'
+        format: timestamp
+      # The message of whichever condition put the row where it is: the
+      # first unhappy one in STATE order, then the Upgradeable blocker.
+      - name: MESSAGE
+        expr: >-
+          [.status.conditions[]? | select(.type == "Available")][0] as $a
+          | [.status.conditions[]? | select(.type == "Degraded")][0] as $d
+          | [.status.conditions[]? | select(.type == "Progressing")][0] as $p
+          | [.status.conditions[]? | select(.type == "Upgradeable")][0] as $u
+          | if ($a.status // "Unknown") != "True" then ($a.message // "")
+            elif ($d.status // "") == "True" then ($d.message // "")
+            elif ($p.status // "") == "True" then ($p.message // "")
+            elif ($u.status // "") == "False" then ($u.message // "")
+            else "" end
+    # Trouble first, then whoever holds the upgrade up; within a class the
+    # most recent change on top. No actions besides navigation: there is
+    # nothing on a ClusterOperator worth mutating from here.
+    sort:
+      - by: STATE
+        rank: [Unavailable, Degraded, Progressing]
+      - by: UPGRADE
+        rank: [blocked, behind]
+      - by: SINCE
+        order: desc
+      - by: NAME
+    actions:
+      - key: enter
+        name: detail
+        short: Show this operator's versions and conditions
+        open: upgrade.operator
+        args:
+          name: .metadata.name
+
+  # Where the list folds, this shows the operator's own account: every
+  # version it tracks — some carry operator and operand separately, and the
+  # list only shows "operator" — then the conditions verbatim.
+  - id: upgrade.operator
+    title: One ClusterOperator's versions and conditions
+    params:
+      - name: name
+        short: clusteroperator name
+        required: true
+    source:
+      script: kubectl get clusteroperator "$name" -o json
+    rows: >-
+      [ .status.versions[]?
+        | {when: "", type: "version \(.name)", status: .version,
+           reason: "", message: ""} ]
+      + [ .status.conditions[]?
+          | {when: .lastTransitionTime, type: .type, status: .status,
+             reason: (.reason // ""), message: (.message // "")} ]
+      | .[]
+    key: .type
+    columns:
+      - name: WHEN
+        expr: .when
+        format: timestamp
+      - name: TYPE
+        expr: .type
+      # No emphasis, deliberately: True is good on Available and bad on
+      # Degraded.
+      - name: STATUS
+        expr: .status
+      - name: REASON
+        expr: .reason
+      - name: MESSAGE
+        expr: .message
+    # Versions first — their WHEN is empty — then the conditions in the
+    # order they last moved.
+    sort:
+      - by: WHEN
+
   # The controller that drives the node rollout. Followed, because a stuck
   # pool is watched rather than read once; --tail brings enough of the past
   # along that the window is not empty while nothing happens.

@@ -65,7 +65,7 @@ views:
       - by: SEVERITY
         rank: ["", critical, warning, none]
       - by: SINCE
-        order: desc
+        order: asc
       - by: ALERT
     actions:
       - key: enter
@@ -146,7 +146,7 @@ views:
       - by: STATE
         rank: [ACTIVE, pending, expired]
       - by: START
-        order: desc
+        order: asc
     actions:
       # Sending an already-expired id fails the whole call, so those rows
       # refuse rather than take the run down with them.

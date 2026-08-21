@@ -101,12 +101,12 @@ views:
           // ( [ .status.conditions[]? | select(.status == "False") | .message ]
                | map(select(. != null)) | first )
           // ""
-    # The most recent change on top: the pod that just went wrong is the one
-    # being looked for. No state ranking — the reasons are open-ended, and
-    # every row is here because it needs attention anyway.
+    # The most recent change at the bottom: the pod that just went wrong is
+    # the one being looked for. No state ranking — the reasons are open-ended,
+    # and every row is here because it needs attention anyway.
     sort:
       - by: SINCE
-        order: desc
+        order: asc
       - by: NAMESPACE
       - by: NAME
     actions:

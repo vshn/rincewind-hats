@@ -54,7 +54,7 @@ views:
     # on every reload. What needs attention is picked out by colour.
     sort:
       - by: START
-        order: desc
+        order: asc
       - by: NAME
     actions:
       - key: enter
@@ -182,7 +182,7 @@ views:
       - by: STATE
         rank: [ACTIVE, upcoming, past]
       - by: START
-        order: desc
+        order: asc
     actions:
       # Creates something, so it acts on no row — and asks for what it needs
       # before it can show what it would run. Times are parsed in jq: the
@@ -422,7 +422,7 @@ views:
             elif ($u.status // "") == "False" then ($u.message // "")
             else "" end
     # Trouble first, then whoever holds the upgrade up; within a class the
-    # most recent change on top. No actions besides navigation: there is
+    # most recent change at the bottom. No actions besides navigation: there is
     # nothing on a ClusterOperator worth mutating from here.
     sort:
       - by: STATE
@@ -430,7 +430,7 @@ views:
       - by: UPGRADE
         rank: [blocked, behind]
       - by: SINCE
-        order: desc
+        order: asc
       - by: NAME
     actions:
       - key: enter

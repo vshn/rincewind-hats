@@ -98,7 +98,7 @@ views:
             then $reason
             else ([.status.conditions[]? | select(.type == "Ready")][0].message // "") end
     # Trouble first: broken kubelet, then a struggling rollout, then merely
-    # cordoned; within a class the most recent change on top.
+    # cordoned; within a class the most recent change at the bottom.
     sort:
       - by: READY
         rank: [NotReady, Unknown, Ready]
@@ -107,7 +107,7 @@ views:
       - by: SCHED
         rank: [cordoned]
       - by: SINCE
-        order: desc
+        order: asc
       - by: NAME
     actions:
       - key: enter

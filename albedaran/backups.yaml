@@ -71,12 +71,12 @@ views:
           | [.status.conditions[]? | select(.type == "Progressing")][0] as $p
           | ($c.message // $p.message // "")
     # Trouble first, then what is still in flight; within a class the most
-    # recent on top, because a stale success is the thing one looks for.
+    # recent at the bottom, so the newest run is where the eye lands last.
     sort:
       - by: STATE
         rank: [Failed, Unknown, Running, Pending, Succeeded]
       - by: SINCE
-        order: desc
+        order: asc
       - by: NAME
     actions:
       - key: enter
@@ -174,12 +174,12 @@ views:
           | [.status.conditions[]? | select(.type == "Progressing")][0] as $p
           | ($c.message // $p.message // "")
     # Trouble first, then what is still in flight; within a class the most
-    # recent on top, because a stale success is the thing one looks for.
+    # recent at the bottom, so the newest run is where the eye lands last.
     sort:
       - by: STATE
         rank: [Failed, Unknown, Running, Pending, Succeeded]
       - by: SINCE
-        order: desc
+        order: asc
       - by: NAME
     actions:
       - key: enter

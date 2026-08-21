@@ -1,0 +1,262 @@
+# All things backup related: object and etcd backup.
+#
+# k8up drives the cluster object backup out of syn-cluster-backup: a Schedule
+# spawns Backup, Check and Prune objects, and each one is a k8s object whose
+# status is a set of conditions over a Job. Progressing says whether the Job
+# still runs, Completed says how it ended, Scrubbed reports the cleanup of
+# old job objects. This group reads those conditions; it does not run k8up.
+
+views:
+  - id: backups.etcd
+    title: K8up cluster etcd backups
+    params:
+      - name: selector
+        short: label selector, as kubectl -l takes it
+    source:
+      # Fully qualified: `backups` alone is ambiguous on a cluster that also
+      # has Velero or another operator claiming the kind.
+      #
+      # Use `if ... fi`, not `[ -n "$x" ] && ...`: the && form leaves exit
+      # status 1 when the parameter is empty, which reads as a failure.
+      script: |
+        if [ -n "$selector" ]; then set -- -l "$selector"; fi
+        kubectl -n syn-cluster-backup-etcd get \
+          backups.k8up.io,checks.k8up.io,prunes.k8up.io,restores.k8up.io \
+          "$@" -o json
+    # kubectl wraps a multi-kind get in a List, and stamps each item with its
+    # own kind — which is what tells a Backup row from a Prune row below.
+    rows: .items[]
+    # Names are only unique per kind, so the kind belongs in the key.
+    key: '"\(.kind)/\(.metadata.name)"'
+    columns:
+      - name: NAME
+        expr: .metadata.name
+      - name: KIND
+        expr: .kind
+      # One column, not a RUNNING/STATUS pair: Progressing and Completed are
+      # two halves of the same answer, and reading them apart invites the
+      # "Finished / Unknown" row that says nothing. k8up writes the verdict
+      # into Completed's reason and only mirrors it in the status field, so
+      # the reason is what this trusts first.
+      - name: STATE
+        expr: >-
+          [.status.conditions[]? | select(.type == "Completed")][0] as $c
+          | [.status.conditions[]? | select(.type == "Progressing")][0] as $p
+          | if $c != null then
+              (if $c.reason == "Succeeded" then "Succeeded"
+               elif $c.reason == "Failed" then "Failed"
+               elif $c.status == "True" then "Succeeded"
+               elif $c.status == "False" then "Failed"
+               else "Unknown" end)
+            elif ($p.status == "True") or (.status.started // false) then "Running"
+            elif (.status.finished // false) then "Unknown"
+            else "Pending" end
+        emphasis: { Succeeded: good, Failed: bad, Running: warn, Pending: warn, Unknown: bad }
+      # The newest transition of any condition: on a finished job they all
+      # land within the same second, and while one is still moving this is
+      # the last sign of life. An absolute timestamp rather than an age —
+      # this column exists to be lined up against job logs, and "4h59m"
+      # cannot be. Falls back to creation for an object that never ran.
+      - name: SINCE
+        expr: >-
+          ([.status.conditions[]?.lastTransitionTime] | sort | last)
+          // .metadata.creationTimestamp // ""
+        format: timestamp
+      # k8up's own words, and they are worth the width: "job 'x' completed
+      # successfully", or on a bad night the reason it did not. Completed
+      # carries the verdict, Progressing covers the still-running case.
+      - name: MESSAGE
+        expr: >-
+          [.status.conditions[]? | select(.type == "Completed")][0] as $c
+          | [.status.conditions[]? | select(.type == "Progressing")][0] as $p
+          | ($c.message // $p.message // "")
+    # Trouble first, then what is still in flight; within a class the most
+    # recent on top, because a stale success is the thing one looks for.
+    sort:
+      - by: STATE
+        rank: [Failed, Unknown, Running, Pending, Succeeded]
+      - by: SINCE
+        order: desc
+      - by: NAME
+    actions:
+      - key: enter
+        name: conditions
+        short: Show this object's conditions
+        open: backups.conditions
+        args:
+          kind: .kind
+          name: .metadata.name
+
+      # Work: runs once per selected row. Select with ␣ or a first — a
+      # mutation never acts on merely what the filter left.
+      #
+      # What this removes is the k8up object and, by owner reference, its Job
+      # and pods. It does not touch the repository: the restic snapshots a
+      # Backup wrote outlive it, and only a Prune takes those away. Saying so
+      # is the difference between tidying the namespace and losing a backup.
+      # `x` closes a tab, so delete takes `d`.
+      - key: d
+        name: delete
+        short: Delete this k8up object
+        confirm: >-
+          "Delete \(map("\(.kind)/\(.metadata.name)") | join(", "))" +
+          "\n\nThe object and its job go; the restic snapshots in the backend stay." +
+          (if any(.[]; (.status.finished // false) | not)
+           then "\n\nSome of these have not finished \u2014 deleting cancels the run."
+           else "" end)
+        env:
+          resource: '"\(.kind | ascii_downcase).k8up.io"'
+          name: .metadata.name
+        script: |
+          kubectl --as system:admin -n syn-cluster-backup-etcd delete "$resource" "$name"
+        reload: true
+  - id: backups.objects
+    title: K8up cluster object backups
+    params:
+      - name: selector
+        short: label selector, as kubectl -l takes it
+    source:
+      # Fully qualified: `backups` alone is ambiguous on a cluster that also
+      # has Velero or another operator claiming the kind.
+      #
+      # Use `if ... fi`, not `[ -n "$x" ] && ...`: the && form leaves exit
+      # status 1 when the parameter is empty, which reads as a failure.
+      script: |
+        if [ -n "$selector" ]; then set -- -l "$selector"; fi
+        kubectl -n syn-cluster-backup get \
+          backups.k8up.io,checks.k8up.io,prunes.k8up.io,restores.k8up.io \
+          "$@" -o json
+    # kubectl wraps a multi-kind get in a List, and stamps each item with its
+    # own kind — which is what tells a Backup row from a Prune row below.
+    rows: .items[]
+    # Names are only unique per kind, so the kind belongs in the key.
+    key: '"\(.kind)/\(.metadata.name)"'
+    columns:
+      - name: NAME
+        expr: .metadata.name
+      - name: KIND
+        expr: .kind
+      # One column, not a RUNNING/STATUS pair: Progressing and Completed are
+      # two halves of the same answer, and reading them apart invites the
+      # "Finished / Unknown" row that says nothing. k8up writes the verdict
+      # into Completed's reason and only mirrors it in the status field, so
+      # the reason is what this trusts first.
+      - name: STATE
+        expr: >-
+          [.status.conditions[]? | select(.type == "Completed")][0] as $c
+          | [.status.conditions[]? | select(.type == "Progressing")][0] as $p
+          | if $c != null then
+              (if $c.reason == "Succeeded" then "Succeeded"
+               elif $c.reason == "Failed" then "Failed"
+               elif $c.status == "True" then "Succeeded"
+               elif $c.status == "False" then "Failed"
+               else "Unknown" end)
+            elif ($p.status == "True") or (.status.started // false) then "Running"
+            elif (.status.finished // false) then "Unknown"
+            else "Pending" end
+        emphasis: { Succeeded: good, Failed: bad, Running: warn, Pending: warn, Unknown: bad }
+      # The newest transition of any condition: on a finished job they all
+      # land within the same second, and while one is still moving this is
+      # the last sign of life. An absolute timestamp rather than an age —
+      # this column exists to be lined up against job logs, and "4h59m"
+      # cannot be. Falls back to creation for an object that never ran.
+      - name: SINCE
+        expr: >-
+          ([.status.conditions[]?.lastTransitionTime] | sort | last)
+          // .metadata.creationTimestamp // ""
+        format: timestamp
+      # k8up's own words, and they are worth the width: "job 'x' completed
+      # successfully", or on a bad night the reason it did not. Completed
+      # carries the verdict, Progressing covers the still-running case.
+      - name: MESSAGE
+        expr: >-
+          [.status.conditions[]? | select(.type == "Completed")][0] as $c
+          | [.status.conditions[]? | select(.type == "Progressing")][0] as $p
+          | ($c.message // $p.message // "")
+    # Trouble first, then what is still in flight; within a class the most
+    # recent on top, because a stale success is the thing one looks for.
+    sort:
+      - by: STATE
+        rank: [Failed, Unknown, Running, Pending, Succeeded]
+      - by: SINCE
+        order: desc
+      - by: NAME
+    actions:
+      - key: enter
+        name: conditions
+        short: Show this object's conditions
+        open: backups.conditions
+        args:
+          kind: .kind
+          name: .metadata.name
+
+      # Work: runs once per selected row. Select with ␣ or a first — a
+      # mutation never acts on merely what the filter left.
+      #
+      # What this removes is the k8up object and, by owner reference, its Job
+      # and pods. It does not touch the repository: the restic snapshots a
+      # Backup wrote outlive it, and only a Prune takes those away. Saying so
+      # is the difference between tidying the namespace and losing a backup.
+      # `x` closes a tab, so delete takes `d`.
+      - key: d
+        name: delete
+        short: Delete this k8up object
+        confirm: >-
+          "Delete \(map("\(.kind)/\(.metadata.name)") | join(", "))" +
+          "\n\nThe object and its job go; the restic snapshots in the backend stay." +
+          (if any(.[]; (.status.finished // false) | not)
+           then "\n\nSome of these have not finished \u2014 deleting cancels the run."
+           else "" end)
+        env:
+          resource: '"\(.kind | ascii_downcase).k8up.io"'
+          name: .metadata.name
+        script: |
+          kubectl --as system:admin -n syn-cluster-backup delete "$resource" "$name"
+        reload: true
+
+  # Where STATE above folds every condition into one word, this shows them
+  # all: Scrubbed and its "Deleted N resources" live here, and so does the
+  # message of a Progressing job that has not reached a verdict yet.
+  - id: backups.conditions
+    title: One k8up object's conditions, as the operator wrote them
+    params:
+      - name: kind
+        short: "k8up kind: Backup, Check, Prune or Restore"
+        required: true
+      - name: name
+        short: object name
+        required: true
+    source:
+      # $kind reaches the script as a parameter, never templated into it, so
+      # a value taken from cluster data cannot become shell code. The row
+      # carries it capitalised ("Prune"), the API group wants it lower.
+      script: |
+        k=$(printf %s "$kind" | tr '[:upper:]' '[:lower:]')
+        kubectl -n syn-cluster-backup get "$k.k8up.io" "$name" -o json
+    # started and finished are not conditions, but they are the only thing
+    # that speaks for an object k8up has not written a condition for yet.
+    rows: >-
+      [ {type: "started",  status: (.status.started // false | tostring),
+         reason: "", message: "", lastTransitionTime: .metadata.creationTimestamp},
+        {type: "finished", status: (.status.finished // false | tostring),
+         reason: "", message: "", lastTransitionTime: ""} ]
+      + [ .status.conditions[]? ]
+      | .[]
+    key: .type
+    columns:
+      - name: WHEN
+        expr: .lastTransitionTime // ""
+        format: timestamp
+      - name: TYPE
+        expr: .type
+      # No emphasis: True is good on Completed and bad on nothing here —
+      # Progressing True merely means it is still running.
+      - name: STATUS
+        expr: .status
+      - name: REASON
+        expr: .reason // ""
+        emphasis: { Succeeded: good, Finished: good, Failed: bad }
+      - name: MESSAGE
+        expr: .message // ""
+    sort:
+      - by: WHEN

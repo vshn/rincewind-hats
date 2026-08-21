@@ -1,0 +1,133 @@
+# Pods that need attention: everything that is neither Running nor Completed.
+
+views:
+  # The filter lives in `rows`, not in the columns: the state a pod shows in
+  # `kubectl get pods` is not the phase alone — a pod whose phase is Running
+  # can be stuck in CrashLoopBackOff, and phase Succeeded prints as
+  # Completed. So the state is derived once, kubectl-style, attached to the
+  # row, and both the filter and the STATE column read that one verdict.
+  - id: pods.failed
+    title: Pods that are neither Running nor Completed
+    params:
+      # Optional: empty searches every namespace.
+      - name: namespace
+        short: namespace, empty for all
+      - name: selector
+        short: label selector, as kubectl -l takes it
+    source:
+      # Use `if ... fi`, not `[ -n "$x" ] && ...`: the && form leaves exit
+      # status 1 when the parameter is empty, which reads as a failure.
+      script: |
+        if [ -n "$selector" ]; then set -- -l "$selector"; fi
+        if [ -n "$namespace" ]; then
+          kubectl -n "$namespace" get pods "$@" -o json
+        else
+          kubectl get pods -A "$@" -o json
+        fi
+    # Deletion wins, then the pod-level reason (Evicted, NodeLost), then the
+    # first unhappy init container, then the first waiting container reason,
+    # then the phase. That is the order kubectl prints, minus its exhaustive
+    # corner cases — close enough that the words on screen match `get pods`.
+    rows: >-
+      .items[]
+      | ( if .metadata.deletionTimestamp != null then "Terminating"
+          elif (.status.reason // "") != "" then .status.reason
+          else
+            ( [ .status.initContainerStatuses[]?
+                | (.state.waiting.reason
+                   // (if (.state.terminated.exitCode // 0) != 0 then "Error" else null end)) ]
+              | map(select(. != null)) | first ) as $init
+            | ( [ .status.containerStatuses[]? | .state.waiting.reason ]
+                | map(select(. != null)) | first ) as $wait
+            | if $init != null then "Init:\($init)"
+              elif $wait != null then $wait
+              elif .status.phase == "Succeeded" then "Completed"
+              else (.status.phase // "Unknown") end
+          end ) as $state
+      | select($state != "Running" and $state != "Completed")
+      | . + {state: $state}
+    key: '"\(.metadata.namespace)/\(.metadata.name)"'
+    columns:
+      - name: NAMESPACE
+        expr: .metadata.namespace
+      - name: NAME
+        expr: .metadata.name
+      # Every row here is trouble by construction; the colours only grade it.
+      # The list of reasons is open-ended, so states outside this map simply
+      # stay plain — which still reads as "not good".
+      - name: STATE
+        expr: .state
+        emphasis:
+          CrashLoopBackOff: bad
+          ImagePullBackOff: bad
+          ErrImagePull: bad
+          CreateContainerConfigError: bad
+          CreateContainerError: bad
+          "Init:CrashLoopBackOff": bad
+          "Init:ImagePullBackOff": bad
+          "Init:ErrImagePull": bad
+          "Init:Error": bad
+          Error: bad
+          Failed: bad
+          Evicted: bad
+          OOMKilled: bad
+          Unknown: bad
+          Pending: warn
+          ContainerCreating: warn
+          PodInitializing: warn
+          Terminating: warn
+      - name: READY
+        expr: >-
+          "\([.status.containerStatuses[]? | select(.ready)] | length)/\(.spec.containers | length)"
+      - name: RESTARTS
+        expr: '[.status.containerStatuses[]?.restartCount] | add // 0 | tostring'
+      # An absolute timestamp rather than an age: this column exists to be
+      # lined up against events and log lines, and "4h59m" cannot. Falls
+      # back to creation for a pod that never started.
+      - name: SINCE
+        expr: .status.startTime // .metadata.creationTimestamp // ""
+        format: timestamp
+      - name: NODE
+        expr: .spec.nodeName // ""
+      # The most specific explanation available: what a waiting container
+      # says about itself ("back-off 5m restarting failed container..."),
+      # then the pod's own message (evictions), then the message of an
+      # unhappy pod condition ("0/3 nodes are available...").
+      - name: MESSAGE
+        expr: >-
+          ( [ .status.containerStatuses[]?, .status.initContainerStatuses[]?
+              | .state.waiting.message ] | map(select(. != null)) | first )
+          // .status.message
+          // ( [ .status.conditions[]? | select(.status == "False") | .message ]
+               | map(select(. != null)) | first )
+          // ""
+    # The most recent change on top: the pod that just went wrong is the one
+    # being looked for. No state ranking — the reasons are open-ended, and
+    # every row is here because it needs attention anyway.
+    sort:
+      - by: SINCE
+        order: desc
+      - by: NAMESPACE
+      - by: NAME
+    actions:
+      # Work: runs once per selected row. Select with ␣ or a first — a
+      # mutation never acts on merely what the filter left.
+      #
+      # Whether the pod comes back depends on who owns it: a Deployment's or
+      # StatefulSet's pod is recreated and effectively restarted, a bare pod
+      # is gone for good. Saying which is on the table is the difference
+      # between a restart and a delete. `x` closes a tab, so delete takes `d`.
+      - key: d
+        name: delete
+        short: Delete this pod
+        confirm: >-
+          "Delete \(map("\(.metadata.namespace)/\(.metadata.name)") | join(", "))" +
+          (if any(.[]; ((.metadata.ownerReferences // []) | length) == 0)
+           then "\n\nSome of these have no owner — nothing will recreate them."
+           else "\n\nEach one is owned by a controller, which will recreate it." end)
+        env:
+          namespace: .metadata.namespace
+          name: .metadata.name
+        script: |
+          kubectl --as system:admin -n "$namespace" delete pod "$name"
+        reload: true

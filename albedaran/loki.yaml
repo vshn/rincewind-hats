@@ -55,6 +55,6 @@ views:
       - key: p
         name: pods
         short: Show unhealthy pods in the Loki namespace
-        open: pods.failed
+        open: pods.status
         args:
           namespace: '"openshift-logging"'

@@ -1,4 +1,5 @@
-# Pods that need attention: everything that is neither Running nor Completed.
+# Pods that need attention: everything that is neither Running nor Completed
+# — and, when asked for, every pod beside them.
 
 views:
   # The filter lives in `rows`, not in the columns: the state a pod shows in
@@ -6,9 +7,16 @@ views:
   # can be stuck in CrashLoopBackOff, and phase Succeeded prints as
   # Completed. So the state is derived once, kubectl-style, attached to the
   # row, and both the filter and the STATE column read that one verdict.
-  - id: pods.failed
-    title: Pods that are neither Running nor Completed
+  - id: pods.status
+    title: Pods that need attention, or every pod when asked
     params:
+      # The filter, not a different view: "all" keeps the columns, the
+      # colours and the sort, and only stops throwing the healthy rows away.
+      # A drill-down that wants to show what a selector picks needs to be
+      # able to show that it picks nothing, which the default cannot.
+      - name: show
+        short: failed or all
+        default: failed
       # Optional: empty searches every namespace.
       - name: namespace
         short: namespace, empty for all
@@ -28,8 +36,15 @@ views:
     # first unhappy init container, then the first waiting container reason,
     # then the phase. That is the order kubectl prints, minus its exhaustive
     # corner cases — close enough that the words on screen match `get pods`.
+    # A parameter's default reaches the script as an environment variable,
+    # but not $args here — an expression sees exactly what was passed, and
+    # null when nothing was. So the default is repeated, and an empty value
+    # is read as absent, the way the script side would read it.
     rows: >-
-      .items[]
+      (if ($args.show // "") == "" then "failed" else $args.show end) as $show
+      | (if $show == "failed" or $show == "all" then .
+         else error("show takes failed or all, not \"\($show)\"") end)
+      | .items[]
       | ( if .metadata.deletionTimestamp != null then "Terminating"
           elif (.status.reason // "") != "" then .status.reason
           else
@@ -44,7 +59,7 @@ views:
               elif .status.phase == "Succeeded" then "Completed"
               else (.status.phase // "Unknown") end
           end ) as $state
-      | select($state != "Running" and $state != "Completed")
+      | select($show == "all" or ($state != "Running" and $state != "Completed"))
       | . + {state: $state}
     key: '"\(.metadata.namespace)/\(.metadata.name)"'
     columns:
@@ -103,7 +118,10 @@ views:
           // ""
     # The most recent change at the bottom: the pod that just went wrong is
     # the one being looked for. No state ranking — the reasons are open-ended,
-    # and every row is here because it needs attention anyway.
+    # so an unlisted one would sort as though it were fine. Colour carries it
+    # instead, which is also what makes `show: all` readable: Running and
+    # Completed are the two states with no emphasis, so the healthy rows are
+    # the plain ones.
     sort:
       - by: SINCE
         order: asc
@@ -131,3 +149,103 @@ views:
         script: |
           kubectl --as system:admin -n "$namespace" delete pod "$name"
         reload: true
+
+  # A disruption budget is the thing that stops a drain, so it is read when a
+  # node will not empty. Most of them are fine and say nothing here; the ones
+  # with a word in STATE are the reason the view exists.
+  - id: pods.pdb
+    title: Pod disruption budgets, and which of them will not let go
+    refresh: 30s
+    params:
+      - name: namespace
+        short: namespace, empty for all
+    source:
+      script: |
+        if [ -n "$namespace" ]; then
+          kubectl -n "$namespace" get poddisruptionbudgets -o json
+        else
+          kubectl get poddisruptionbudgets -A -o json
+        fi
+    rows: .items[]
+    key: '"\(.metadata.namespace)/\(.metadata.name)"'
+    columns:
+      - name: NAMESPACE
+        expr: .metadata.namespace
+      - name: NAME
+        expr: .metadata.name
+      # Whichever of the two was set, printed as written: either can be a
+      # percentage, and 25% is worth seeing as 25% rather than resolved.
+      - name: BUDGET
+        expr: >-
+          if .spec.minAvailable != null then "min \(.spec.minAvailable)"
+          elif .spec.maxUnavailable != null then "max \(.spec.maxUnavailable)"
+          else "" end
+      # Healthy against selected, kubectl-style. The right-hand number is the
+      # whole question when a budget selects nothing.
+      - name: HEALTHY
+        expr: '"\(.status.currentHealthy // 0)/\(.status.expectedPods // 0)"'
+      - name: NEEDS
+        expr: .status.desiredHealthy // 0
+      - name: ALLOWED
+        expr: .status.disruptionsAllowed // 0
+      # The verdict, and the reason for the view. Empty when there is nothing
+      # to say — the numbers beside it already say it — so that a word here
+      # is always a problem.
+      #
+      # "selects nothing" comes first because it makes the rest meaningless:
+      # with no pods selected, nothing is blocked either. Then the one
+      # distinction that decides what to do about it — every selected pod is
+      # healthy and the budget still permits no disruption, so it is the spec
+      # that will not allow a drain, not a pod that has yet to come back.
+      - name: STATE
+        expr: >-
+          (.status // {}) as $s
+          | ($s.expectedPods // 0) as $expected
+          | ($s.currentHealthy // 0) as $healthy
+          | if any($s.conditions[]?; .reason == "SyncFailed") then "SyncFailed"
+            elif ($s.observedGeneration // 0) != (.metadata.generation // 0) then "stale"
+            elif $expected == 0 then "selects nothing"
+            elif ($s.disruptionsAllowed // 0) > 0 then ""
+            elif $healthy >= $expected then "unsatisfiable"
+            else "blocks drain" end
+        emphasis:
+          { SyncFailed: bad, unsatisfiable: bad, "blocks drain": bad,
+            "selects nothing": warn, stale: warn }
+      - name: SINCE
+        expr: '([.status.conditions[]?.lastTransitionTime] | sort | last) // ""'
+        format: timestamp
+      - name: MESSAGE
+        expr: '[.status.conditions[]? | select((.message // "") != "")][0].message // ""'
+    # The spec's own faults first, then what merely waits on a pod. A budget
+    # with nothing to say sinks to the bottom, being unranked. Within a class
+    # the most recent at the bottom.
+    sort:
+      - by: STATE
+        rank: [SyncFailed, unsatisfiable, "blocks drain", "selects nothing", stale]
+      - by: SINCE
+    actions:
+      # Every number in the row is counted over the pods this selector picks,
+      # so that is where an explanation is. The selector is rewritten as
+      # kubectl takes it — matchLabels as k=v, matchExpressions as the
+      # set-based forms — and an empty selector stays empty, which is exactly
+      # what it means: every pod in the namespace.
+      - key: enter
+        name: pods
+        short: Show the pods this budget counts
+        open: pods.status
+        args:
+          # Every pod, not only the unhappy ones: a budget that selects
+          # nothing has to look different from one whose pods are all fine,
+          # and under the default both are an empty table.
+          show: '"all"'
+          namespace: .metadata.namespace
+          selector: >-
+            (.spec.selector // {}) as $s
+            | (($s.matchLabels // {}) | to_entries | map("\(.key)=\(.value)"))
+              + (($s.matchExpressions // []) | map(
+                  if .operator == "In" then "\(.key) in (\(.values | join(",")))"
+                  elif .operator == "NotIn" then "\(.key) notin (\(.values | join(",")))"
+                  elif .operator == "Exists" then .key
+                  elif .operator == "DoesNotExist" then "!\(.key)"
+                  else error("selector operator \(.operator) is not one kubectl -l can take") end))
+            | join(",")

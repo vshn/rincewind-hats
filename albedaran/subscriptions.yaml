@@ -92,7 +92,7 @@ views:
     source:
       # Filtering by name with --field-selector rather than naming the object
       # keeps the output a list either way, so rows reads the same. The
-      # `if ... fi` is pods.failed's, and for the same reason: the && form
+      # `if ... fi` is pods.status's, and for the same reason: the && form
       # leaves exit status 1 when the parameter is empty.
       script: |
         if [ -n "$name" ]; then set -- --field-selector "metadata.name=$name"; fi

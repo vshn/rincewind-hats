@@ -63,7 +63,10 @@ views:
           | . + {node: $nodes[.uuid]}
         ' "$d/servers.json" "$d/nodes.json"
     rows: .
-    key: .name
+    # The short name, because it is what the table shows and what `rincewind
+    # act` has to be given: a key one cannot read off the screen is a key
+    # nobody can name a row by.
+    key: .name | split(".")[0]
     columns:
       # Every machine in the project carries the cluster domain, so the
       # first label is the whole of what distinguishes one row from the
@@ -147,6 +150,73 @@ views:
         open: cloudscale.volumes
         args:
           server: .uuid
+
+      # The four below are deliberately dummies. They carry the whole shape
+      # of a working action — the selection, the values asked for, the
+      # question, the command on screen, one invocation per row — and then
+      # run an echo. Nothing is sent to cloudscale and nothing on the cluster
+      # is touched, which is what makes them safe to press.
+      #
+      # What would replace the echo is one call per row: a POST to the
+      # server sub-resource for stop, start and reboot, and a PATCH carrying
+      # a new flavor for the scaling one. Whoever does that should also add
+      # `reload: true`, which is left off here because a dummy changes
+      # nothing there would be any point in re-reading. And it should think
+      # about the machines that are nodes: draining belongs before stopping,
+      # and the STATE column is what says which rows those are.
+      #
+      # Every echo carries the state the machine is in, so pressing boot on
+      # something already running answers rather than refuses.
+      - key: S
+        name: scale
+        short: (dummy) Give these machines a different flavor
+        params:
+          - name: flavor
+            short: flavor slug, as cloudscale spells it - flex-16-4, plus-8-2
+            required: true
+        confirm: >-
+          "(dummy) Scale \(map(.name | split(".")[0]) | join(", "))
+          to \($args.flavor)"
+        env:
+          name: .name | split(".")[0]
+          uuid: .uuid
+          state: .status
+          was: .flavor.slug // ""
+        script: |
+          echo "dummy aktion ausgeführt: scale $name $was -> $flavor (uuid $uuid, jetzt $state)"
+
+      - key: T
+        name: stop
+        short: (dummy) Shut these machines down
+        confirm: '"(dummy) Stop \(map(.name | split(".")[0]) | join(", "))"'
+        env:
+          name: .name | split(".")[0]
+          uuid: .uuid
+          state: .status
+        script: |
+          echo "dummy aktion ausgeführt: stop $name (uuid $uuid, jetzt $state)"
+
+      - key: R
+        name: reboot
+        short: (dummy) Restart these machines
+        confirm: '"(dummy) Reboot \(map(.name | split(".")[0]) | join(", "))"'
+        env:
+          name: .name | split(".")[0]
+          uuid: .uuid
+          state: .status
+        script: |
+          echo "dummy aktion ausgeführt: reboot $name (uuid $uuid, jetzt $state)"
+
+      - key: B
+        name: boot
+        short: (dummy) Power these machines on
+        confirm: '"(dummy) Boot \(map(.name | split(".")[0]) | join(", "))"'
+        env:
+          name: .name | split(".")[0]
+          uuid: .uuid
+          state: .status
+        script: |
+          echo "dummy aktion ausgeführt: boot $name (uuid $uuid, jetzt $state)"
 
   # Volumes are where a cluster quietly costs money. A PersistentVolume that
   # is deleted while the volume survives leaves nothing behind in the cluster

@@ -1,6 +1,8 @@
 # Pods that need attention: everything that is neither Running nor Completed
 # — and, when asked for, every pod beside them.
 
+rincewind: ">= 0.7.0"
+
 views:
   # The filter lives in `rows`, not in the columns: the state a pod shows in
   # `kubectl get pods` is not the phase alone — a pod whose phase is Running

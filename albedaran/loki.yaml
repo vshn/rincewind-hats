@@ -2,6 +2,8 @@
 # status.conditions: whether the stack came up, and if not, which component
 # is holding it back.
 
+rincewind: ">= 0.7.0"
+
 views:
   # The old `aldedigger loki syncstatus` printed only the conditions standing
   # at True, which is what is in force. The ones at False are kept here

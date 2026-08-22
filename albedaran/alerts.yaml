@@ -5,6 +5,8 @@
 # impersonate: pod/exec is a privileged verb either way. Note also that while
 # Alertmanager itself is down, this group is blind.
 
+rincewind: ">= 0.7.0"
+
 views:
   - id: alerts.firing
     title: Firing alerts, silenced and inhibited ones included

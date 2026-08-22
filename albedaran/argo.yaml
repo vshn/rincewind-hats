@@ -2,6 +2,8 @@
 # impersonate, because changing an Application needs rights an operator does
 # not carry around day to day.
 
+rincewind: ">= 0.7.0"
+
 views:
   - id: argo.apps
     title: ArgoCD applications and their sync state

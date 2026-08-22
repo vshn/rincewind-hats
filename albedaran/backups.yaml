@@ -6,6 +6,8 @@
 # still runs, Completed says how it ended, Scrubbed reports the cleanup of
 # old job objects. This group reads those conditions; it does not run k8up.
 
+rincewind: ">= 0.7.0"
+
 views:
   - id: backups.etcd
     title: K8up cluster etcd backups

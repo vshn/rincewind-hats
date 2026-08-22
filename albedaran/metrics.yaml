@@ -18,6 +18,8 @@
 #
 # Needs oc for the token, plus curl and jq, like the rest of this hat.
 
+rincewind: ">= 0.7.0"
+
 views:
   - id: nodes.cpu
     title: CPU per node, one week, avg and max per 30m

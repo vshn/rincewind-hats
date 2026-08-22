@@ -1,6 +1,8 @@
 # All things cluster upgrade related: the appuio upgrade controller's jobs
 # and suspension windows, plus the cluster's own version state.
 
+rincewind: ">= 0.7.0"
+
 views:
   - id: upgrade.jobs
     title: UpgradeJobs and where each one got to

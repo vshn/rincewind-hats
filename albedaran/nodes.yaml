@@ -1,6 +1,8 @@
 # All things node related: the kubelet, scheduling, and the machine-config
 # rollout — plus the pools that drive it.
 
+rincewind: ">= 0.7.0"
+
 views:
   # Port of the old builtin `nodes status`: kubelet, scheduling and
   # machine-config rollout. The CONFIG column judges a node against its

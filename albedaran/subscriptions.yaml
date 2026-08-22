@@ -3,6 +3,8 @@
 # step from one version to the next — and a manual one waits for a human to
 # say yes, which is the whole reason this group exists.
 
+rincewind: ">= 0.7.0"
+
 views:
   - id: subscriptions.operators
     title: OLM subscriptions and the operator version each one holds

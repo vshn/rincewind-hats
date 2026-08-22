@@ -11,6 +11,8 @@
 # wants to be cheap. Identical sources run once per round, which is why the
 # two below that read the API share one script down to the character.
 
+rincewind: ">= 0.7.0"
+
 contexts:
   # The identity case: no `active:`, so this is active whenever the script
   # produced a value at all — which is to say whenever there is a current
@@ -50,9 +52,17 @@ contexts:
   # The script is identical to the one above on purpose — that is what makes
   # the engine run it once per round rather than twice.
   - id: cloudscale
-    short: Cloudscale-managed clusters
+    short: Cloudscale infrastructure
     source:
       script: kubectl get --raw '/api/v1/nodes?limit=1'
+    label: '"Cloudscale"'
     active: '.items[0].spec.providerID // "" | startswith("cloudscale://")'
+    tools: [kubectl, curl]
+  - id: vsphere
+    short: vSphere infrastructure
+    source:
+      script: kubectl get --raw '/api/v1/nodes?limit=1'
+    label: '"vSphere"'
+    active: '.items[0].spec.providerID // "" | startswith("vsphere://")'
     tools: [kubectl, curl]
 

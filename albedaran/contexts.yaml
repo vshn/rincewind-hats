@@ -1,0 +1,58 @@
+# Where one is. A context is a script that prints JSON, with jq over what it
+# printed: `label:` is what the chrome reads top right, `active:` says whether
+# the context applies here at all, and a view's `needs:` hides it where every
+# context it names has resolved away.
+#
+# The hat only ever says how to find out — never where it is. That answer has
+# to come from the world, which is what keeps a hat from claiming to be
+# somewhere it is not.
+#
+# A context is asked again on every change of view, behind a short TTL, so it
+# wants to be cheap. Identical sources run once per round, which is why the
+# two below that read the API share one script down to the character.
+
+contexts:
+  # The identity case: no `active:`, so this is active whenever the script
+  # produced a value at all — which is to say whenever there is a current
+  # context to read.
+  #
+  # The kubeconfig and nothing else, so this answers in milliseconds and goes
+  # on answering when the cluster does not. That matters: it is the label one
+  # reads before a mutation, and a cluster being unwell is exactly when
+  # knowing which cluster it is matters most.
+  #
+  # Two shapes turn up in practice and the label has to survive both:
+  #
+  #   c-appuio-lab-cloudscale-rma-0                          (APPUiO)
+  #   default/api-lagclprod01-ocp-linzag-at:6443/you          (oc login)
+  #
+  # The second is a namespace, an API host and a user, and only the host is
+  # the cluster; printed whole it is fifty characters of mostly nothing and
+  # the chrome would drop it for want of room. So it is cut down to the host,
+  # without the `api-` prefix and the port.
+  - id: kubernetes
+    short: The cluster the scripts will run against
+    source:
+      script: kubectl config view --minify -o json
+    label: >-
+      ."current-context"
+      | if test("/")
+        then split("/")[1] | sub("^api-"; "") | sub(":[0-9]+$"; "")
+        else .
+        end
+    tools: [kubectl, oc, jq, curl]
+
+  # The same question narrowed to one answer, for a view to name in `needs:`
+  # when it only makes sense here. No label of its own: `platform` above
+  # already puts the word in the chrome, and saying it twice would be saying
+  # it twice.
+  #
+  # The script is identical to the one above on purpose — that is what makes
+  # the engine run it once per round rather than twice.
+  - id: cloudscale
+    short: Cloudscale-managed clusters
+    source:
+      script: kubectl get --raw '/api/v1/nodes?limit=1'
+    active: '.items[0].spec.providerID // "" | startswith("cloudscale://")'
+    tools: [kubectl, curl]
+

@@ -85,7 +85,7 @@ views:
             --type merge -p '{"spec":{"syncPolicy":{"automated":{"prune":true,"selfHeal":true}}}}'
         reload: true
 
-      - key: R
+      - key: u
         name: refresh
         short: Ask ArgoCD to reconcile now
         env:
@@ -99,7 +99,7 @@ views:
       # ArgoCD has cached and renders them from the repository again. That is
       # the one that helps when the catalog has moved on and a plain refresh
       # keeps reporting the app as Synced against yesterday.
-      - key: H
+      - key: U
         name: hard-refresh
         short: Hard refresh (re-render the manifests, ignoring the cache)
         env:
@@ -186,7 +186,7 @@ views:
 
       # The rows here are resources, so the application comes from the view's
       # own parameter rather than from the row under the cursor.
-      - key: R
+      - key: u
         name: refresh
         short: Ask ArgoCD to reconcile this application now
         scope: none
@@ -196,8 +196,8 @@ views:
         reload: true
 
       # As in argo.apps: hard drops the cached manifests first.
-      - key: H
-        name: rerender
+      - key: U
+        name: hard-refresh
         short: Hard refresh (re-render this application, ignoring the cache)
         scope: none
         script: |

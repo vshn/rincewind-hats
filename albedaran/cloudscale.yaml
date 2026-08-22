@@ -1,0 +1,706 @@
+# The machines under the cluster. Every view here is one call to the
+# cloudscale.ch API joined against what the cluster believes about itself —
+# a node is a server, a PersistentVolume is a volume — and the rows worth
+# opening the view for are the ones where the two sides disagree.
+#
+# The token is the cluster's own, out of the secret the CSI driver reads, so
+# there is nothing to set up locally and the project is always the one this
+# cluster lives in. Reading that secret needs rights an operator does not
+# carry around day to day, which is why that one call impersonates; every
+# other read runs as whoever is logged in.
+#
+# Both views name `needs: cloudscale`, so on a cluster that runs anywhere
+# else they are not offered at all rather than offered and broken.
+#
+# Needs curl and jq on the PATH, like the rest of this hat.
+
+rincewind: ">= 0.7.0"
+
+views:
+  # A node that has gone NotReady says nothing about the machine it was
+  # running on. This view puts the two side by side: the server as
+  # cloudscale sees it, the node as the cluster sees it, in one row. The
+  # third case is the one nobody looks for — a machine in the project that
+  # is not a node at all.
+  - id: cloudscale.servers
+    title: The machines under the nodes, as cloudscale sees them
+    needs: cloudscale
+    refresh: 60s
+    source:
+      script: |
+        set -eu
+        d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
+        # Whether this is a cloudscale cluster at all is settled before the
+        # view runs, by `needs: cloudscale`, so the only thing left to say
+        # here is that the secret could not be read.
+        token=$(kubectl --as system:admin -n syn-csi-cloudscale get secret cloudscale \
+          -o go-template='{{ index .data "access-token" | base64decode }}' 2>/dev/null) || {
+          echo "cannot read secret cloudscale in syn-csi-cloudscale" >&2
+          exit 1
+        }
+        # -sf prints nothing at all on a refusal, so the exit status is
+        # turned back into a sentence here rather than left as a number.
+        # Never called down a pipe: exit 1 in a subshell would not stop the
+        # script, and a view built on half an answer is worse than no view.
+        api() {
+          curl -sf -H "Authorization: Bearer $token" "https://api.cloudscale.ch/v1/$1" || {
+            echo "the cloudscale API refused /v1/$1; is the token still valid?" >&2
+            exit 1
+          }
+        }
+        api servers > "$d/servers.json"
+        kubectl get nodes -o json > "$d/nodes.json"
+        jq -s '
+          # providerID is cloudscale://<uuid>, and is the only thing tying a
+          # node to the machine it runs on. Servers with no node keep their
+          # row: that absence is the finding.
+          ([ .[1].items[]
+             | (.spec.providerID // "") as $id
+             | select($id | startswith("cloudscale://"))
+             | {key: ($id | ltrimstr("cloudscale://")), value: .} ]
+           | from_entries) as $nodes
+          | .[0][]
+          | . + {node: $nodes[.uuid]}
+        ' "$d/servers.json" "$d/nodes.json"
+    rows: .
+    key: .name
+    columns:
+      # Every machine in the project carries the cluster domain, so the
+      # first label is the whole of what distinguishes one row from the
+      # next — and it is what the node is called, which is what makes the
+      # two tables read against each other.
+      - name: NAME
+        expr: .name | split(".")[0]
+      - name: STATE
+        expr: .status
+        emphasis:
+          { running: good, stopped: bad, error: bad, unknown: bad,
+            changing: warn, paused: warn,
+            rescue_running: warn, rescue_stopped: warn }
+      # Silent when the node is called what the machine is called, which is
+      # the normal case and says nothing. It speaks for the two that matter:
+      # a machine the cluster knows nothing about, and a node whose name has
+      # come adrift from its machine.
+      - name: NODE
+        expr: >-
+          if .node == null then "not in cluster"
+          elif .node.metadata.name == (.name | split(".")[0]) then ""
+          else .node.metadata.name end
+        emphasis: { "not in cluster": warn }
+      # Cordoning folds into the readiness rather than taking a column of its
+      # own: on a machine that is up, "Ready" and "Ready, cordoned" are two
+      # different answers to the same question.
+      - name: READY
+        expr: >-
+          if .node == null then ""
+          else ([.node.status.conditions[]? | select(.type == "Ready")][0]) as $c
+          | (if $c == null then "Unknown"
+          elif $c.status == "True" then "Ready"
+          elif $c.status == "False" then "NotReady"
+          else "Unknown" end) as $ready
+          | if .node.spec.unschedulable then "\($ready), cordoned" else $ready end
+          end
+        emphasis:
+          { Ready: good, "Ready, cordoned": warn,
+            NotReady: bad, "NotReady, cordoned": bad,
+            Unknown: bad, "Unknown, cordoned": bad }
+      - name: FLAVOR
+        expr: .flavor.slug // ""
+      - name: ZONE
+        expr: .zone.slug // ""
+      # Empty means this machine shares a hypervisor with anything else in
+      # the project — which for a control plane node is a finding.
+      - name: GROUP
+        expr: '[.server_groups[]?.name] | join(",")'
+      # For the case the node is unreachable and the console or ssh is what
+      # is left. Cluster machines sit on the private network only, so this
+      # cannot ask for a public address and stop there; public first, then
+      # whatever else the machine has.
+      - name: IPV4
+        expr: >-
+          ([.interfaces[]? | select(.type == "public")]
+           + [.interfaces[]? | select(.type != "public")])
+          | [.[] | .addresses[]? | select(.version == 4) | .address][0] // ""
+    # Trouble first, and within it the machines the cluster is missing.
+    sort:
+      - by: STATE
+        rank: [error, stopped, unknown, rescue_stopped, rescue_running,
+               paused, changing, running]
+      - by: READY
+        rank: ["NotReady, cordoned", NotReady, Unknown, "Unknown, cordoned",
+               "Ready, cordoned", Ready]
+      - by: NAME
+    actions:
+      - key: enter
+        name: conditions
+        short: Show what the cluster says about this node
+        open: nodes.conditions
+        args:
+          node: >-
+            if .node == null
+            then error("\(.name) is not a node of this cluster")
+            else .node.metadata.name end
+
+      - key: v
+        name: volumes
+        short: Show the volumes attached to this machine
+        open: cloudscale.volumes
+        args:
+          server: .uuid
+
+  # Volumes are where a cluster quietly costs money. A PersistentVolume that
+  # is deleted while the volume survives leaves nothing behind in the cluster
+  # to notice it by, so the only place the two can be compared is here: the
+  # project on one side, the PersistentVolumes on the other, joined on the
+  # uuid the CSI driver stores as its volume handle.
+  - id: cloudscale.volumes
+    title: Volumes in the project, against the volumes the cluster claims
+    needs: cloudscale
+    refresh: 60s
+    params:
+      # Set by the drilldown from cloudscale.servers. Optional, so this view
+      # is still listed and still shows the whole project by itself.
+      - name: server
+        short: only volumes attached to this server uuid
+    source:
+      script: |
+        set -eu
+        d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
+        # Token and api(), as in cloudscale.servers.
+        token=$(kubectl --as system:admin -n syn-csi-cloudscale get secret cloudscale \
+          -o go-template='{{ index .data "access-token" | base64decode }}' 2>/dev/null) || {
+          echo "cannot read secret cloudscale in syn-csi-cloudscale" >&2
+          exit 1
+        }
+        api() {
+          curl -sf -H "Authorization: Bearer $token" "https://api.cloudscale.ch/v1/$1" || {
+            echo "the cloudscale API refused /v1/$1; is the token still valid?" >&2
+            exit 1
+          }
+        }
+        api volumes > "$d/volumes.json"
+        kubectl get pv -o json > "$d/pv.json"
+        jq -s '
+          # Joined on the handle rather than on the driver name: a handle
+          # from some other CSI simply matches no volume, which is the same
+          # answer without having to know what that driver calls itself.
+          ([ .[1].items[]
+             | select((.spec.csi.volumeHandle // "") != "")
+             | {key: .spec.csi.volumeHandle, value: .} ]
+           | from_entries) as $pvs
+          | .[0][]
+          | . + {pv: $pvs[.uuid]}
+        ' "$d/volumes.json" "$d/pv.json"
+    rows: >-
+      select(($args.server // "") == ""
+      or (((.server_uuids // []) | index($args.server)) != null))
+    key: .name
+    columns:
+      # One word for what is wrong with this volume, if anything. A node root
+      # disk has no PersistentVolume and never will, so only a volume named
+      # the way the CSI driver names its own can be an orphan; everything
+      # else that hangs off nothing is merely unattached.
+      - name: STATE
+        expr: >-
+          ((.servers // []) | length) as $attached
+          | if .current_operation then .current_operation
+          elif .pv == null then
+          (if (.name | startswith("pvc-")) then "orphan"
+          elif $attached == 0 then "unattached"
+          else "" end)
+          elif (.pv.status.phase // "") != "Bound" then .pv.status.phase
+          elif $attached == 0 then "detached"
+          else "" end
+        # detached is not a fault and is not coloured as one: a claim whose
+        # workload is scaled to zero looks exactly like this, and so does a
+        # completed job. It is here because 150G that nothing is running
+        # against is still 150G one pays for.
+        emphasis:
+          { orphan: bad, unattached: bad, Failed: bad,
+            Released: warn, detached: warn, Available: warn, Pending: warn,
+            attaching: warn, scaling_volume: warn, snapshotting: warn,
+            server_action: warn, reverting_volume_to_snapshot: warn,
+            creating_volume_from_snapshot: warn }
+      # A disk is usually named after the machine it hangs off, which the
+      # row already names in SERVER — so that prefix comes off and `root` or
+      # `ssd1` is what is left. A volume attached to nothing keeps its whole
+      # name, which is exactly the row where one wants it in full.
+      - name: NAME
+        expr: >-
+          ([.servers[]?.name] | first) as $s
+          | if $s != null and (.name | startswith("\($s)-"))
+          then (.name | ltrimstr("\($s)-"))
+          else .name end
+      # Empty here and a machine in SERVER is a node root disk, which is the
+      # normal state of affairs and not a finding.
+      - name: PVC
+        expr: >-
+          (.pv.spec.claimRef // null) as $c
+          | if $c == null then "" else "\($c.namespace)/\($c.name)" end
+      - name: SIZE
+        expr: '"\(.size_gb)G"'
+      - name: TYPE
+        expr: .type // ""
+      # Shortened the same way as in cloudscale.servers, so the two tables
+      # can be read against each other.
+      - name: SERVER
+        expr: '[.servers[]?.name | split(".")[0]] | join(",")'
+      # An age rather than a timestamp: what one wants to know about an
+      # orphan is how long nobody has missed it.
+      - name: AGE
+        expr: .created_at // ""
+        format: age
+    sort:
+      - by: STATE
+        rank: [orphan, unattached, Failed, Released, detached]
+      - by: NAME
+    actions:
+      - key: enter
+        name: pods
+        short: Show every pod in the namespace that claims this volume
+        open: pods.status
+        args:
+          namespace: >-
+            (.pv.spec.claimRef.namespace // null) as $ns
+            | if $ns == null
+            then error("\(.name) is not claimed by anything in this cluster")
+            else $ns end
+          show: '"all"'
+
+  # A load balancer is the one part of the path into the cluster that the
+  # cluster cannot see. Its health check runs from outside, against a node
+  # port, and when it fails the node goes on reporting itself Ready while no
+  # traffic reaches it. So the column that matters is how many members are
+  # answering, and the row that matters is a balancer whose Service is gone.
+  - id: cloudscale.loadbalancers
+    title: Load balancers, and whether the nodes behind them still answer
+    needs: cloudscale
+    refresh: 60s
+    source:
+      script: |
+        set -eu
+        d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
+        # Token and api(), as in cloudscale.servers.
+        token=$(kubectl --as system:admin -n syn-csi-cloudscale get secret cloudscale \
+          -o go-template='{{ index .data "access-token" | base64decode }}' 2>/dev/null) || {
+          echo "cannot read secret cloudscale in syn-csi-cloudscale" >&2
+          exit 1
+        }
+        api() {
+          curl -sf -H "Authorization: Bearer $token" "https://api.cloudscale.ch/v1/$1" || {
+            echo "the cloudscale API refused /v1/$1; is the token still valid?" >&2
+            exit 1
+          }
+        }
+        api load-balancers > "$d/lbs.json"
+        api load-balancers/listeners > "$d/listeners.json"
+        api load-balancers/pools > "$d/pools.json"
+        # Members hang off a pool and the API has no flat list of them, so
+        # this is one call per pool. Written to a file rather than piped, so
+        # that a refusal inside the loop stops the script.
+        : > "$d/raw-members.json"
+        for pool in $(jq -r '.[].uuid' "$d/pools.json"); do
+          api "load-balancers/pools/$pool/members" >> "$d/raw-members.json"
+        done
+        jq -s 'add // []' "$d/raw-members.json" > "$d/members.json"
+        kubectl get services -A -o json > "$d/svc.json"
+        jq -s '
+          # Two ways to the Service, because the annotation is written by the
+          # controller and the name by the API: the annotation is the truth
+          # when it is there, and the name carries the Service uid for when
+          # it is not.
+          .[3].items as $svcs
+          | ([ $svcs[]
+               | select(.spec.type == "LoadBalancer")
+               | (((.metadata.annotations // {})["k8s.cloudscale.ch/loadbalancer-uuid"]) // "") as $u
+               | select($u != "")
+               | {key: $u, value: .} ] | from_entries) as $byUuid
+          | ([ $svcs[]
+               | select(.spec.type == "LoadBalancer")
+               | {key: "k8s-service-\(.metadata.uid)", value: .} ] | from_entries) as $byName
+          | .[1] as $listeners
+          | .[2] as $members
+          | .[0][]
+          | . as $lb
+          | [ $members[] | select(.load_balancer.uuid == $lb.uuid) ] as $mine
+          | $lb + {
+              service: ($byUuid[$lb.uuid] // $byName[$lb.name]),
+              up: ([ $mine[] | select(.monitor_status == "up") ] | length),
+              total: ($mine | length),
+              ports: ([ $listeners[]
+                        | select(.load_balancer.uuid == $lb.uuid)
+                        | "\(.protocol)/\(.protocol_port)" ] | unique | join(","))
+            }
+        ' "$d/lbs.json" "$d/listeners.json" "$d/members.json" "$d/svc.json"
+    rows: .
+    key: .uuid
+    columns:
+      # A balancer the controller made for a Service that no longer exists
+      # goes on reporting itself running, which is exactly why that case is
+      # folded in here rather than left to be noticed.
+      - name: STATE
+        expr: >-
+          if .service == null and (.name | startswith("k8s-service-"))
+          then "orphan" else .status end
+        emphasis:
+          { running: good, orphan: bad, degraded: bad, error: bad,
+            changing: warn, unknown: warn }
+      # The Service is the name a person knows this by; the balancer's own
+      # name is a uuid in a costume, and only worth printing when there is
+      # no Service to name it after.
+      - name: NAME
+        expr: >-
+          if .service == null then .name
+          else "\(.service.metadata.namespace)/\(.service.metadata.name)" end
+      - name: MEMBERS
+        expr: '"\(.up)/\(.total) up"'
+      - name: PORTS
+        expr: .ports
+      - name: VIP
+        expr: '[.vip_addresses[]? | select(.version == 4) | .address][0] // ""'
+      - name: ZONE
+        expr: .zone.slug // ""
+    sort:
+      - by: STATE
+        rank: [orphan, error, degraded, changing, unknown, running]
+      - by: NAME
+    actions:
+      - key: enter
+        name: members
+        short: Show the nodes behind this balancer and their health check
+        open: cloudscale.members
+        args:
+          lb: .uuid
+
+      - key: p
+        name: pods
+        short: Show the pods the balanced Service selects
+        open: pods.status
+        args:
+          namespace: >-
+            if .service == null
+            then error("\(.name) does not belong to a Service of this cluster")
+            else .service.metadata.namespace end
+          selector: >-
+            [(.service.spec.selector // {}) | to_entries[]
+             | "\(.key)=\(.value)"] | join(",")
+          show: '"all"'
+
+  # Reached by drilling in from the balancers: without one it has nothing to
+  # show, which is why `lb` is required and this view is not listed.
+  - id: cloudscale.members
+    title: The nodes behind one balancer, as its health check finds them
+    needs: cloudscale
+    refresh: 30s
+    params:
+      - name: lb
+        short: load balancer uuid
+        required: true
+    source:
+      script: |
+        set -eu
+        d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
+        # Token and api(), as in cloudscale.servers.
+        token=$(kubectl --as system:admin -n syn-csi-cloudscale get secret cloudscale \
+          -o go-template='{{ index .data "access-token" | base64decode }}' 2>/dev/null) || {
+          echo "cannot read secret cloudscale in syn-csi-cloudscale" >&2
+          exit 1
+        }
+        api() {
+          curl -sf -H "Authorization: Bearer $token" "https://api.cloudscale.ch/v1/$1" || {
+            echo "the cloudscale API refused /v1/$1; is the token still valid?" >&2
+            exit 1
+          }
+        }
+        api load-balancers/pools > "$d/pools.json"
+        : > "$d/raw-members.json"
+        for pool in $(jq -r --arg lb "$lb" \
+            '.[] | select(.load_balancer.uuid == $lb) | .uuid' "$d/pools.json"); do
+          api "load-balancers/pools/$pool/members" >> "$d/raw-members.json"
+        done
+        jq -s 'add // []' "$d/raw-members.json" > "$d/members.json"
+        kubectl get nodes -o json > "$d/nodes.json"
+        jq -s '
+          # A member is an address and a port, and the address is the node
+          # internal ip — which is the only thing naming the node it stands
+          # for.
+          ([ .[1].items[]
+             | .metadata.name as $name
+             | .status.addresses[]?
+             | select(.type == "InternalIP")
+             | {key: .address, value: $name} ] | from_entries) as $nodes
+          | .[0][]
+          | . + {node: ($nodes[.address] // null)}
+        ' "$d/members.json" "$d/nodes.json"
+    rows: .
+    key: .uuid
+    columns:
+      # Disabled comes first because a disabled member is not being checked
+      # at all: its last monitor_status is a memory, not a reading.
+      - name: STATE
+        expr: >-
+          if .enabled == false then "disabled"
+          else (.monitor_status // "unknown") end
+        emphasis:
+          { up: good, down: bad, disabled: warn, changing: warn,
+            no_monitor: warn, unknown: warn }
+      - name: NODE
+        expr: .node // "not a node of this cluster"
+        emphasis: { "not a node of this cluster": warn }
+      - name: ADDRESS
+        expr: '"\(.address):\(.protocol_port)"'
+      # The port the check is made against, which is not the port traffic
+      # goes to and is the one that decides whether this member is used.
+      - name: CHECK
+        expr: .monitor_port // ""
+      - name: POOL
+        expr: .pool.name // ""
+    sort:
+      - by: STATE
+        rank: [down, disabled, no_monitor, unknown, changing, up]
+      - by: NODE
+
+  # What has been done to the project, which is the account no part of the
+  # cluster keeps: when a machine or a volume disappears at three in the
+  # morning, this is the only place that says what did it — and mostly the
+  # answer is one of the cluster own tokens, which is itself worth seeing.
+  #
+  # The log can only be read forwards from the oldest entry still kept, and
+  # a cursor the API did not hand out itself comes back as an empty page, so
+  # there is no seeking to the recent end — only walking to it. That is
+  # around seventy requests and a quarter of a minute on a cluster this
+  # size, which is why this view has no refresh: it is opened when the
+  # question is asked, not kept warm.
+  - id: cloudscale.logs
+    title: What has been done to this project, newest last
+    needs: cloudscale
+    params:
+      - name: keep
+        short: how many of the most recent entries to show
+        default: "500"
+    source:
+      script: |
+        set -eu
+        d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
+        # Token as in cloudscale.servers. No api() here: every url after the
+        # first comes from the answer before it, so there is no path to pass.
+        token=$(kubectl --as system:admin -n syn-csi-cloudscale get secret cloudscale \
+          -o go-template='{{ index .data "access-token" | base64decode }}' 2>/dev/null) || {
+          echo "cannot read secret cloudscale in syn-csi-cloudscale" >&2
+          exit 1
+        }
+        url="https://api.cloudscale.ch/v1/project-logs"
+        page=0
+        reached=no
+        : > "$d/pages.json"
+        # `if`, not `[ ... ] && break`: the && form leaves exit status 1 on
+        # the last round and set -e would read that as a failure.
+        while [ "$page" -lt 100 ]; do
+          body=$(curl -sf -H "Authorization: Bearer $token" "$url") || {
+            echo "the cloudscale API refused the project log; is the token still valid?" >&2
+            exit 1
+          }
+          printf '%s' "$body" | jq '.results' >> "$d/pages.json"
+          page=$((page + 1))
+          if [ "$(printf '%s' "$body" | jq '.results | length')" -lt 200 ]; then
+            reached=yes
+            break
+          fi
+          url=$(printf '%s' "$body" | jq -r '.next')
+        done
+        # Stopping short would show the oldest entries under a title that
+        # promises the newest, so it does not show them at all.
+        if [ "$reached" = no ]; then
+          echo "this project log is longer than 100 pages and the API pages only forwards, so its recent end cannot be reached" >&2
+          exit 1
+        fi
+        jq -s --argjson keep "$keep" 'add // [] | .[-$keep:]' "$d/pages.json"
+    rows: .[]
+    key: '"\(.timestamp) \(.action)"'
+    columns:
+      - name: AT
+        expr: .timestamp
+        format: timestamp
+      - name: ACTION
+        expr: .action
+      # An api token says which system did it, a user says which person.
+      # Whichever is there is the answer to the same question.
+      - name: WHO
+        expr: >-
+          .actor.api_token.description // .actor.user.display_name
+          // .actor.user.email // ""
+      - name: FROM
+        expr: .ip_address // ""
+      - name: WHAT
+        expr: .message // ""
+    # Newest at the bottom, where reading ends.
+    sort:
+      - by: AT
+        order: asc
+
+  # Anti-affinity is a promise that two machines will not share a hypervisor,
+  # and it is only kept for the machines actually in the group. A group of
+  # one keeps no promise at all, so the smallest groups sort first.
+  - id: cloudscale.groups
+    title: Anti-affinity groups, and who is actually in them
+    needs: cloudscale
+    refresh: 60s
+    source:
+      script: |
+        set -eu
+        d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
+        # Token and api(), as in cloudscale.servers.
+        token=$(kubectl --as system:admin -n syn-csi-cloudscale get secret cloudscale \
+          -o go-template='{{ index .data "access-token" | base64decode }}' 2>/dev/null) || {
+          echo "cannot read secret cloudscale in syn-csi-cloudscale" >&2
+          exit 1
+        }
+        api() {
+          curl -sf -H "Authorization: Bearer $token" "https://api.cloudscale.ch/v1/$1" || {
+            echo "the cloudscale API refused /v1/$1; is the token still valid?" >&2
+            exit 1
+          }
+        }
+        api server-groups
+    rows: .[]
+    key: .uuid
+    columns:
+      - name: NAME
+        expr: .name
+      - name: TYPE
+        expr: .type // ""
+      - name: ZONE
+        expr: .zone.slug // ""
+      - name: N
+        expr: '[.servers[]?] | length'
+      - name: SERVERS
+        expr: '[.servers[]?.name | split(".")[0]] | sort | join(", ")'
+    sort:
+      - by: N
+      - by: NAME
+
+  # A floating ip is what a name in DNS actually points at, so the question
+  # is always the same: is anything behind it. One that points at nothing is
+  # either a migration half done or an address being paid for out of habit.
+  - id: cloudscale.floatingips
+    title: Floating addresses, and what is behind them
+    needs: cloudscale
+    refresh: 60s
+    source:
+      script: |
+        set -eu
+        d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
+        # Token and api(), as in cloudscale.servers.
+        token=$(kubectl --as system:admin -n syn-csi-cloudscale get secret cloudscale \
+          -o go-template='{{ index .data "access-token" | base64decode }}' 2>/dev/null) || {
+          echo "cannot read secret cloudscale in syn-csi-cloudscale" >&2
+          exit 1
+        }
+        api() {
+          curl -sf -H "Authorization: Bearer $token" "https://api.cloudscale.ch/v1/$1" || {
+            echo "the cloudscale API refused /v1/$1; is the token still valid?" >&2
+            exit 1
+          }
+        }
+        api floating-ips
+    rows: .[]
+    key: .network
+    columns:
+      # A single address is written as a /32 or a /128, which is a true
+      # statement nobody wants to read; a range that really is a range, like
+      # a /27, keeps its prefix.
+      - name: IP
+        expr: .network | sub("/(32|128)$"; "")
+      - name: POINTS AT
+        expr: >-
+          if .server != null then (.server.name | split(".")[0])
+          elif .load_balancer != null then .load_balancer.name
+          else "nothing" end
+        emphasis: { nothing: bad }
+      - name: PTR
+        expr: .reverse_ptr // ""
+      - name: WHERE
+        expr: .region.slug // .zone.slug // ""
+    sort:
+      - by: POINTS AT
+        rank: [nothing]
+      - by: IP
+
+  # What the buckets hold and what they cost to hold. The cluster writes its
+  # backups, its registry and its logs to object storage and never mentions
+  # the size again; this is where a bucket that has been growing all year
+  # becomes visible.
+  - id: cloudscale.objects
+    title: Object storage, by bucket, over the last few days
+    needs: cloudscale
+    refresh: 5m
+    params:
+      - name: days
+        short: how many days back to total up
+        default: "7"
+    source:
+      script: |
+        set -eu
+        d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
+        # Token and api(), as in cloudscale.servers.
+        token=$(kubectl --as system:admin -n syn-csi-cloudscale get secret cloudscale \
+          -o go-template='{{ index .data "access-token" | base64decode }}' 2>/dev/null) || {
+          echo "cannot read secret cloudscale in syn-csi-cloudscale" >&2
+          exit 1
+        }
+        api() {
+          curl -sf -H "Authorization: Bearer $token" "https://api.cloudscale.ch/v1/$1" || {
+            echo "the cloudscale API refused /v1/$1; is the token still valid?" >&2
+            exit 1
+          }
+        }
+        # Dates in jq, because the date command flags differ between GNU and
+        # BSD and jq is already required here. Only `date +%s` is asked for,
+        # which is the same everywhere.
+        now=$(date -u +%s)
+        start=$(jq -rn --argjson n "$now" --argjson d "$days" \
+          '$n - $d * 86400 | strftime("%Y-%m-%d")')
+        end=$(jq -rn --argjson n "$now" '$n | strftime("%Y-%m-%d")')
+        api "metrics/buckets?start=$start&end=$end" > "$d/buckets.json"
+        api objects-users > "$d/users.json"
+        jq -s '
+          # Only the display name is taken across. The users carry their
+          # secret keys in the same object, and nothing here has any use for
+          # them.
+          ([ .[1][] | {key: .id, value: .display_name} ] | from_entries) as $users
+          | .[0].data[]
+          | . + {user: ($users[.subject.objects_user_id] // "")}
+        ' "$d/buckets.json" "$d/users.json"
+    rows: .
+    key: .subject.name
+    columns:
+      # Every bucket a cluster makes for itself is named after the cluster,
+      # and the cluster is what the column beside it says.
+      - name: BUCKET
+        expr: >-
+          (.user // "") as $u
+          | if $u != "" and (.subject.name | startswith("\($u)-"))
+          then (.subject.name | ltrimstr("\($u)-"))
+          else .subject.name end
+      - name: USER
+        expr: .user // ""
+      # A number, not a rendered size: the engine sorts on what the
+      # expression returned, and "9.5G" would sort under "80.1G".
+      - name: GIB
+        expr: >-
+          ((.time_series | last).usage.storage_bytes // 0)
+          / 1073741824 * 100 | round / 100
+      - name: OBJECTS
+        expr: (.time_series | last).usage.object_count // 0
+      - name: REQUESTS
+        expr: (.time_series | last).usage.requests // 0
+      - name: SENT GIB
+        expr: >-
+          ((.time_series | last).usage.sent_bytes // 0)
+          / 1073741824 * 100 | round / 100
+    # Biggest first. This is a size and not a time, so it is the one sort in
+    # the hat that still counts down.
+    sort:
+      - by: GIB
+        order: desc
+      - by: BUCKET

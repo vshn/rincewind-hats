@@ -360,16 +360,17 @@ views:
     title: ClusterOperators and where the upgrade finds them
     refresh: 60s
     source:
+      shell: [bash, -euo, pipefail, -c]
       script: |
-        d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
-        kubectl get clusteroperators -o json > "$d/cos.json"
-        kubectl get clusterversion version -o json > "$d/cv.json" 2>/dev/null \
-          || echo '{}' > "$d/cv.json"
-        jq -s '
-          (.[1].status.desired.version // "") as $target
-          | .[0].items[]
+        # The ClusterVersion is best effort: it names the version every
+        # operator is being pulled towards, and without it the operators
+        # still say what they are doing, only not what for.
+        cv=$(kubectl get clusterversion version -o json 2>/dev/null) || cv='{}'
+        kubectl get clusteroperators -o json | jq --argjson cv "$cv" '
+          ($cv.status.desired.version // "") as $target
+          | .items[]
           | . + {target: $target}
-        ' "$d/cos.json" "$d/cv.json"
+        '
     rows: .
     key: .metadata.name
     columns:

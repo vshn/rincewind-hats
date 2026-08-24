@@ -20,6 +20,7 @@ views:
       #
       # Use `if ... fi`, not `[ -n "$x" ] && ...`: the && form leaves exit
       # status 1 when the parameter is empty, which reads as a failure.
+      shell: [bash, -euo, pipefail, -c]
       script: |
         if [ -n "$selector" ]; then set -- -l "$selector"; fi
         kubectl -n syn-cluster-backup-etcd get \
@@ -124,6 +125,7 @@ views:
       #
       # Use `if ... fi`, not `[ -n "$x" ] && ...`: the && form leaves exit
       # status 1 when the parameter is empty, which reads as a failure.
+      shell: [bash, -euo, pipefail, -c]
       script: |
         if [ -n "$selector" ]; then set -- -l "$selector"; fi
         kubectl -n syn-cluster-backup get \
@@ -240,6 +242,7 @@ views:
       # $kind reaches the script as a parameter, never templated into it, so
       # a value taken from cluster data cannot become shell code. The row
       # carries it capitalised ("Prune"), the API group wants it lower.
+      shell: [bash, -euo, pipefail, -c]
       script: |
         k=$(printf %s "$kind" | tr '[:upper:]' '[:lower:]')
         kubectl -n "$namespace" get "$k.k8up.io" "$name" -o json

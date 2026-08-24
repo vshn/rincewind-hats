@@ -8,10 +8,9 @@ views:
   # machine-config rollout. The CONFIG column judges a node against its
   # pool's rendered target — the state annotation alone reads "Done" on a
   # node the operator has not even told about a new config yet. That join
-  # needs both nodes and pools, so the script does it with jq and emits one
-  # enriched node object per stream value; the columns then only look at
-  # their own row. Needs jq on the PATH; pools are best effort, so the view
-  # keeps working on clusters without the MachineConfig operator.
+  # needs both nodes and pools, and the script does it in jq before the
+  # columns ever see a row. Needs jq on the PATH; pools are best effort, so
+  # the view keeps working on clusters without the MachineConfig operator.
   - id: nodes.status
     title: Kubelet, scheduling and machine-config rollout
     # Optional: empty lists every node, set it lists one pool's. The value
@@ -21,30 +20,50 @@ views:
       - name: selector
         short: label selector, as kubectl -l takes it
     source:
+      # pipefail is what lets the fetch stay a pipe: without it a kubectl
+      # that cannot reach the cluster would hand jq an empty stdin, and the
+      # view would draw an empty table as if the cluster had no nodes. With
+      # it the pipeline fails where kubectl failed, in kubectl's own words.
+      shell: [bash, -euo, pipefail, -c]
       script: |
-        d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
+        # Pools are best effort: on a cluster without the MachineConfig
+        # operator there are none, and CONFIG then falls back to what the
+        # node says about itself.
+        pools=$(kubectl get machineconfigpools -o json 2>/dev/null) \
+          || pools='{"items":[]}'
         # Use `if ... fi`, not `[ -n "$x" ] && ...`: the && form leaves exit
         # status 1 when the parameter is empty, which reads as a failure.
+        # A declared parameter is always in the environment, empty when
+        # nobody set it, so set -u has nothing to complain about here.
         if [ -n "$selector" ]; then set -- -l "$selector"; fi
-        kubectl get nodes "$@" -o json > "$d/nodes.json"
-        kubectl get machineconfigpools -o json > "$d/pools.json" 2>/dev/null \
-          || echo '{"items":[]}' > "$d/pools.json"
-        jq -s '
-          .[1].items as $pools
-          | .[0].items[]
-          | . as $n
-          | ($n.metadata.labels // {}) as $lbl
-          | [ $pools[]
-              | (.spec.nodeSelector.matchLabels // {}) as $sel
-              | select(($sel | length) > 0
-                  and ([$sel | to_entries[] | $lbl[.key] == .value] | all)) ] as $matching
-          | ( [ $matching[] | select(.metadata.name == "master") ][0]
-              // ( [ $matching[] | select(.metadata.name != "master" and .metadata.name != "worker") ]
-                   | sort_by([-(.spec.nodeSelector.matchLabels | length), .metadata.name]) | .[0] )
-              // [ $matching[] | select(.metadata.name == "worker") ][0]
-            ) as $pool
-          | $n + {poolTarget: ($pool.status.configuration.name // "")}
-        ' "$d/nodes.json" "$d/pools.json"
+        # The pools ride along as an argument, the nodes go down the pipe:
+        # the nodes are the document that grows with the cluster, and an
+        # argument list has a limit a pipe does not.
+        kubectl get nodes "$@" -o json | jq --argjson pools "$pools" '
+          # A pool covers a node when every label of its selector is on the
+          # node. A pool that selects nothing covers nothing, not everything.
+          def covers($labels):
+            (.spec.nodeSelector.matchLabels // {})
+            | length > 0 and all(to_entries[]; $labels[.key] == .value);
+
+          # A node is normally covered by both "worker" and a custom pool,
+          # and it is the custom one that is rolled out to it. "master"
+          # outranks everything; between custom pools, the more specific
+          # selector wins, and the name breaks the remaining tie.
+          def pool_of($labels):
+            [$pools.items[] | select(covers($labels))]
+            | ( map(select(.metadata.name == "master"))[0]
+                // ( map(select(.metadata.name | . != "master" and . != "worker"))
+                     | sort_by([-(.spec.nodeSelector.matchLabels | length),
+                                .metadata.name])[0] )
+                // map(select(.metadata.name == "worker"))[0] );
+
+          # One enriched node per stream value; the columns then only ever
+          # look at their own row.
+          .items[]
+          | . + {poolTarget: (pool_of(.metadata.labels // {})
+                              | .status.configuration.name // "")}
+        '
     rows: .
     key: .metadata.name
     columns:
@@ -305,24 +324,28 @@ views:
         short: node name
         required: true
     source:
+      shell: [bash, -euo, pipefail, -c]
       script: |
-        d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
-        kubectl get nodes "$node" -o json > "$d/node.json"
-        kubectl get machineconfigpools -o json > "$d/pools.json" 2>/dev/null \
-          || echo '{"items":[]}' > "$d/pools.json"
-        jq -s '
-          .[1].items as $pools
-          | .[0] as $n
-          | ($n.metadata.labels // {}) as $lbl
-          | [ $pools[]
-              | (.spec.nodeSelector.matchLabels // {}) as $sel
-              | select(($sel | length) > 0
-                  and ([$sel | to_entries[] | $lbl[.key] == .value] | all)) ] as $matching
-          | ( [ $matching[] | select(.metadata.name == "master") ][0]
-              // ( [ $matching[] | select(.metadata.name != "master" and .metadata.name != "worker") ]
-                   | sort_by([-(.spec.nodeSelector.matchLabels | length), .metadata.name]) | .[0] )
-              // [ $matching[] | select(.metadata.name == "worker") ][0]
-            ) as $pool
+        # Pools are best effort, and the join is the one nodes.status
+        # makes; the two views must agree on it, or the list and the
+        # drill-down would disagree about the same node.
+        pools=$(kubectl get machineconfigpools -o json 2>/dev/null) \
+          || pools='{"items":[]}'
+        kubectl get nodes "$node" -o json | jq --argjson pools "$pools" '
+          def covers($labels):
+            (.spec.nodeSelector.matchLabels // {})
+            | length > 0 and all(to_entries[]; $labels[.key] == .value);
+
+          def pool_of($labels):
+            [$pools.items[] | select(covers($labels))]
+            | ( map(select(.metadata.name == "master"))[0]
+                // ( map(select(.metadata.name | . != "master" and . != "worker"))
+                     | sort_by([-(.spec.nodeSelector.matchLabels | length),
+                                .metadata.name])[0] )
+                // map(select(.metadata.name == "worker"))[0] );
+
+          . as $n
+          | pool_of($n.metadata.labels // {}) as $pool
           | ($n.metadata.annotations // {}) as $a
           | ($a["machineconfiguration.openshift.io/state"] // "") as $state
           | ($a["machineconfiguration.openshift.io/currentConfig"] // "") as $cur
@@ -342,7 +365,7 @@ views:
               {what: "reason",       value: ($a["machineconfiguration.openshift.io/reason"] // "")},
               {what: "schedulable",  value: (if $n.spec.unschedulable then "no" else "yes" end)} ]
           | .[]
-        ' "$d/node.json" "$d/pools.json"
+        '
     rows: .
     key: .what
     columns:

@@ -235,6 +235,7 @@ views:
         # a fifth matcher along inside the fourth. set -f, because a matcher
         # like namespace=~"syn.*" must not glob against the filesystem; the
         # loop drops the empty words a stray comma leaves behind.
+        shell: [bash, -euo, pipefail, -c]
         script: |
           set -f; IFS=,
           set -- $matchers
@@ -313,6 +314,7 @@ views:
                 end;
             $args.until | moment(nowmin) | todate
         confirm: '"Silence the alert with fingerprint \($args.fingerprint) until \($args.until)"'
+        shell: [bash, -euo, pipefail, -c]
         script: |
           alert=$(kubectl -n openshift-monitoring --as system:admin exec sts/alertmanager-main -- \
             amtool --alertmanager.url=http://localhost:9093 alert query -o json \

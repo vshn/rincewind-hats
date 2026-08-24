@@ -29,6 +29,7 @@ views:
       - name: selector
         short: label selector, as kubectl -l takes it
     source:
+      shell: [bash, -euo, pipefail, -c]
       script: |
         host=$(kubectl -n openshift-monitoring get route thanos-querier \
           -o jsonpath='{.spec.host}')
@@ -40,10 +41,13 @@ views:
         # The recording rule's name changed across cluster versions; probe
         # for the newer spelling and fall back to the older one.
         rule=instance:node_cpu_utilisation:rate1m
+        # `|| n=0` because this call is a probe, not a fetch: a cluster
+        # that answers with nothing is the very case the fallback is for,
+        # and pipefail would otherwise end the view on it.
         n=$(curl -sf -G "https://$host/api/v1/query" \
           -H "Authorization: Bearer $token" \
-          --data-urlencode "query=$rule" | jq '.data.result | length')
-        if [ "${n:-0}" -eq 0 ]; then rule=instance:node_cpu_utilisation:rate5m; fi
+          --data-urlencode "query=$rule" | jq '.data.result | length') || n=0
+        if [ "$n" -eq 0 ]; then rule=instance:node_cpu_utilisation:rate5m; fi
         end=$(date +%s)
         start=$((end - 7 * 24 * 3600))
         q() {
@@ -68,6 +72,7 @@ views:
       - name: selector
         short: label selector, as kubectl -l takes it
     source:
+      shell: [bash, -euo, pipefail, -c]
       script: |
         host=$(kubectl -n openshift-monitoring get route thanos-querier \
           -o jsonpath='{.spec.host}')
@@ -79,10 +84,12 @@ views:
         # The memory ratio rule is a gauge, no rate suffix. Where a cluster
         # lacks it, fall back to computing the same ratio from node_exporter.
         rule=instance:node_memory_utilisation:ratio
+        # `|| n=0` because this call is a probe, not a fetch: see the
+        # same line in nodes.cpu.
         n=$(curl -sf -G "https://$host/api/v1/query" \
           -H "Authorization: Bearer $token" \
-          --data-urlencode "query=$rule" | jq '.data.result | length')
-        if [ "${n:-0}" -gt 0 ]; then
+          --data-urlencode "query=$rule" | jq '.data.result | length') || n=0
+        if [ "$n" -gt 0 ]; then
           expr="${rule}{instance=~\"$re\"}"
         else
           expr="(1 - sum by (instance)(node_memory_MemAvailable_bytes{instance=~\"$re\"})

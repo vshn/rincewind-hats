@@ -67,6 +67,7 @@ views:
         confirm: '"Pause auto-sync on \(map(.metadata.name) | join(", "))"'
         env:
           app: .metadata.name
+        shell: [bash, -euo, pipefail, -c]
         script: |
           kubectl -n syn --as system:admin patch applications.argoproj.io root \
             --type merge -p '{"spec":{"syncPolicy":{"automated":null}}}'
@@ -125,8 +126,8 @@ views:
           | join(", "))"
         env:
           app: .metadata.name
+        shell: [bash, -euo, pipefail, -c]
         script: |
-          set -eu
           # The application's own sync policy decides the operation, read now
           # rather than taken from the row, so both views can run this and a
           # row half a refresh old cannot decide what gets pruned. No revision
@@ -215,8 +216,8 @@ views:
         short: Sync this application now
         scope: none
         confirm: '"Sync \($args.app) now"'
+        shell: [bash, -euo, pipefail, -c]
         script: |
-          set -eu
           # The application's own sync policy decides the operation, read now
           # rather than taken from the row, so both views can run this and a
           # row half a refresh old cannot decide what gets pruned. No revision
@@ -250,6 +251,7 @@ views:
         short: application name
         required: true
     source:
+      shell: [bash, -euo, pipefail, -c]
       script: |
         kubectl -n syn logs -f sts/syn-argocd-application-controller --tail 5000 \
           | { grep --line-buffered -F "$app" || true; }

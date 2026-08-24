@@ -27,6 +27,7 @@ views:
     source:
       # Use `if ... fi`, not `[ -n "$x" ] && ...`: the && form leaves exit
       # status 1 when the parameter is empty, which reads as a failure.
+      shell: [bash, -euo, pipefail, -c]
       script: |
         if [ -n "$selector" ]; then set -- -l "$selector"; fi
         if [ -n "$namespace" ]; then
@@ -162,6 +163,7 @@ views:
       - name: namespace
         short: namespace, empty for all
     source:
+      shell: [bash, -euo, pipefail, -c]
       script: |
         if [ -n "$namespace" ]; then
           kubectl -n "$namespace" get poddisruptionbudgets -o json
@@ -286,6 +288,7 @@ views:
     # paste. Wiki markup is what Data Center speaks and what the new cloud
     # editor refuses, and it is not written here: this hat wears one hat.
     source:
+      shell: [bash, -euo, pipefail, -c]
       script: |
         case "$include" in problems) ;;
           *) echo "include takes problems, not \"$include\"" >&2; exit 1 ;;

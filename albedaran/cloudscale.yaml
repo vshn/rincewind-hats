@@ -27,8 +27,8 @@ views:
     needs: cloudscale
     refresh: 60s
     source:
+      shell: [bash, -euo, pipefail, -c]
       script: |
-        set -eu
         d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
         # Whether this is a cloudscale cluster at all is settled before the
         # view runs, by `needs: cloudscale`, so the only thing left to say
@@ -40,8 +40,9 @@ views:
         }
         # -sf prints nothing at all on a refusal, so the exit status is
         # turned back into a sentence here rather than left as a number.
-        # Never called down a pipe: exit 1 in a subshell would not stop the
-        # script, and a view built on half an answer is worse than no view.
+        # Its exit reaches the script even from inside a pipe, because
+        # pipefail carries it out; a view built on half an answer is worse
+        # than no view.
         api() {
           curl -sf -H "Authorization: Bearer $token" "https://api.cloudscale.ch/v1/$1" || {
             echo "the cloudscale API refused /v1/$1; is the token still valid?" >&2
@@ -233,8 +234,8 @@ views:
       - name: server
         short: only volumes attached to this server uuid
     source:
+      shell: [bash, -euo, pipefail, -c]
       script: |
-        set -eu
         d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
         # Token and api(), as in cloudscale.servers.
         token=$(kubectl --as system:admin -n syn-csi-cloudscale get secret cloudscale \
@@ -347,8 +348,8 @@ views:
     needs: cloudscale
     refresh: 60s
     source:
+      shell: [bash, -euo, pipefail, -c]
       script: |
-        set -eu
         d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
         # Token and api(), as in cloudscale.servers.
         token=$(kubectl --as system:admin -n syn-csi-cloudscale get secret cloudscale \
@@ -366,8 +367,8 @@ views:
         api load-balancers/listeners > "$d/listeners.json"
         api load-balancers/pools > "$d/pools.json"
         # Members hang off a pool and the API has no flat list of them, so
-        # this is one call per pool. Written to a file rather than piped, so
-        # that a refusal inside the loop stops the script.
+        # this is one call per pool. Appended to a file because the loop
+        # collects; a refusal inside it stops the script either way.
         : > "$d/raw-members.json"
         for pool in $(jq -r '.[].uuid' "$d/pools.json"); do
           api "load-balancers/pools/$pool/members" >> "$d/raw-members.json"
@@ -467,8 +468,8 @@ views:
         short: load balancer uuid
         required: true
     source:
+      shell: [bash, -euo, pipefail, -c]
       script: |
-        set -eu
         d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
         # Token and api(), as in cloudscale.servers.
         token=$(kubectl --as system:admin -n syn-csi-cloudscale get secret cloudscale \
@@ -549,8 +550,8 @@ views:
         short: how many of the most recent entries to show
         default: "500"
     source:
+      shell: [bash, -euo, pipefail, -c]
       script: |
-        set -eu
         d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
         # Token as in cloudscale.servers. No api() here: every url after the
         # first comes from the answer before it, so there is no path to pass.
@@ -616,9 +617,8 @@ views:
     needs: cloudscale
     refresh: 60s
     source:
+      shell: [bash, -euo, pipefail, -c]
       script: |
-        set -eu
-        d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
         # Token and api(), as in cloudscale.servers.
         token=$(kubectl --as system:admin -n syn-csi-cloudscale get secret cloudscale \
           -o go-template='{{ index .data "access-token" | base64decode }}' 2>/dev/null) || {
@@ -657,9 +657,8 @@ views:
     needs: cloudscale
     refresh: 60s
     source:
+      shell: [bash, -euo, pipefail, -c]
       script: |
-        set -eu
-        d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
         # Token and api(), as in cloudscale.servers.
         token=$(kubectl --as system:admin -n syn-csi-cloudscale get secret cloudscale \
           -o go-template='{{ index .data "access-token" | base64decode }}' 2>/dev/null) || {
@@ -709,8 +708,8 @@ views:
         short: how many days back to total up
         default: "7"
     source:
+      shell: [bash, -euo, pipefail, -c]
       script: |
-        set -eu
         d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
         # Token and api(), as in cloudscale.servers.
         token=$(kubectl --as system:admin -n syn-csi-cloudscale get secret cloudscale \

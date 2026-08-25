@@ -1,0 +1,685 @@
+# What the platform costs, per node class. Everything in the openshift-*
+# namespaces — which is more than operators: Prometheus, Loki, the registry
+# and the ingress live there too — measured twice, as what it reserves and
+# as what it actually uses.
+#
+# The three views run one and the same script, word for word, and differ
+# only in which of its rows they keep. That script reads every pod on the
+# cluster, so it is the most expensive thing in this hat; the refresh is
+# slow on purpose, because capacity is not a per-second question.
+#
+# Attribution runs through the pods rather than the workload specs. A
+# Deployment does not know which machines its copies went to, and where
+# they went is the whole question.
+#
+# Needs jq and awk on the PATH. `kubectl top` is best effort: without it
+# the two USE columns read zero and the rest still answers.
+
+rincewind: ">= 0.7.0"
+
+views:
+  # The headline: how much of each class of machine the platform has taken
+  # before anything of yours runs, and what one more node of that class
+  # costs on the day it joins.
+  - id: platform.classes
+    title: What the platform reserves, per class of machine
+    refresh: 2m
+    params:
+      - name: platform
+        short: which platform - openshift, projectsyn, or all for both
+        default: "all"
+    source:
+      shell: [bash, -euo, pipefail, -c]
+      script: |
+        d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
+        kubectl get pods -A -o json > "$d/pods.json"
+        kubectl get nodes -o json > "$d/nodes.json"
+        # Best effort, exactly like the pools in nodes.status: without
+        # metrics the requests still answer the capacity question, and a
+        # missing metrics server should not take the view down with it.
+        kubectl top pods -A --no-headers 2>/dev/null \
+          | awk '{printf "{\"ns\":\"%s\",\"name\":\"%s\",\"cpu\":\"%s\",\"mem\":\"%s\"}\n", $1, $2, $3, $4}' \
+          | jq -s '.' > "$d/top.json" || echo '[]' > "$d/top.json"
+        # ${class-} rather than $class: the three views share this script
+        # word for word, and the one that summarises classes has no such
+        # parameter to set. Under set -u the bare name would end the run.
+        # Refused here rather than in jq: a typo should say so before two
+        # kubectl calls have been spent on it.
+        case "$platform" in
+          openshift|projectsyn|all) ;;
+          *) echo "platform takes openshift, projectsyn or all, not \"$platform\"" >&2
+             exit 1 ;;
+        esac
+        jq -s --arg want "$platform" --arg klass "${class-}" '
+          # Kubernetes quantities, into millicores and into bytes. Both
+          # grammars carry a milli suffix, and memory really is written that
+          # way now and then, which is worth catching rather than dying on.
+          def cpu:
+            if . == null then 0
+            elif type == "number" then . * 1000
+            elif endswith("m") then (.[:-1] | tonumber)
+            elif endswith("u") then (.[:-1] | tonumber) / 1000
+            elif endswith("n") then (.[:-1] | tonumber) / 1000000
+            else (tonumber * 1000) end;
+          def mem:
+            if . == null then 0
+            elif type == "number" then .
+            else . as $s
+            | (if   $s | endswith("Ki") then [2, 1024]
+               elif $s | endswith("Mi") then [2, 1048576]
+               elif $s | endswith("Gi") then [2, 1073741824]
+               elif $s | endswith("Ti") then [2, 1099511627776]
+               elif $s | endswith("m")  then [1, 0.001]
+               elif ($s | endswith("k")) or ($s | endswith("K")) then [1, 1000]
+               elif $s | endswith("M")  then [1, 1000000]
+               elif $s | endswith("G")  then [1, 1000000000]
+               elif $s | endswith("T")  then [1, 1000000000000]
+               else [0, 1] end) as [$cut, $mul]
+            | (($s | if $cut > 0 then .[:-$cut] else . end) | tonumber) * $mul
+            end;
+          # The class of a node is its most specific role. worker and
+          # control-plane are dropped as the two that say least: every node
+          # here is a worker, and every master is a control plane.
+          def classOf:
+            [ (.metadata.labels // {}) | keys[]
+              | select(startswith("node-role.kubernetes.io/"))
+              | ltrimstr("node-role.kubernetes.io/") | select(. != "") ]
+            | [ .[] | select(. != "worker" and . != "control-plane") ]
+            | if length > 0 then (sort | join(",")) else "worker" end;
+          # The two platforms, by the namespaces they claim. A namespace can
+          # only match one of them: nothing starts with both. Everything else
+          # is somebody workload rather than the platform, and has no row.
+          def platformOf:
+            if test("^(openshift|kube)(-|$)") then "openshift"
+            elif test("^(cilium|appuio|syn)(-|$)") then "projectsyn"
+            else null end;
+
+          .[1].items as $nodes
+          | ([ $nodes[] | {key: .metadata.name, value: classOf} ] | from_entries) as $class
+          | ([ $nodes[] | classOf ] | group_by(.)
+             | map({key: .[0], value: length}) | from_entries) as $count
+          | ([ $nodes[]
+               | {class: classOf,
+                  cpu: (.status.allocatable.cpu | cpu),
+                  mem: (.status.allocatable.memory | mem)} ]
+             | group_by(.class)
+             | map({key: .[0].class,
+                    value: {cpu: ([.[].cpu] | add), mem: ([.[].mem] | add)}})
+             | from_entries) as $alloc
+          | ([ .[2][] | {key: "\(.ns)/\(.name)", value: .} ] | from_entries) as $use
+
+          # One record per pod, carrying the workload it belongs to and the
+          # class of the machine it actually landed on. Attribution has to
+          # come from the pods: a Deployment does not know where its copies
+          # went, and that is the whole question here.
+          | [ .[0].items[]
+              | (.metadata.namespace | platformOf) as $plat
+              | select($plat != null)
+              | select($want == "all" or $plat == $want)
+              | select(.status.phase == "Running" or .status.phase == "Pending")
+              | (.metadata.ownerReferences[0] // {kind: "Pod", name: .metadata.name}) as $o
+              | ((.metadata.labels // {})["pod-template-hash"] // "") as $hash
+              | (.spec.nodeName // "") as $node
+              | ($use["\(.metadata.namespace)/\(.metadata.name)"] // {}) as $u
+              | { ns: .metadata.namespace,
+                  platform: $plat,
+                  # A ReplicaSet is named after its Deployment plus the hash
+                  # the pod carries as a label, so taking it off is exact
+                  # rather than a guess at where the name ends.
+                  # A mirror pod belongs to its Node, so the owner names the
+                  # machine and not the thing running on it. The pod itself
+                  # is named for both, and taking the machine off leaves the
+                  # agent — which is what puts three masters on one row.
+                  name: (if $o.kind == "ReplicaSet"
+                         then ($o.name | sub("-\($hash)$"; ""))
+                         elif $o.kind == "Node"
+                         then (.metadata.name | sub("-\($node)$"; ""))
+                         else $o.name end),
+                  # Static pods belong to a Node and run one per machine,
+                  # which makes them agents whatever the api calls them.
+                  kind: (if $o.kind == "ReplicaSet" then "Deployment"
+                         elif $o.kind == "Node" then "Static" else $o.kind end),
+                  class: ($class[.spec.nodeName] // "unscheduled"),
+                  cpuReq: ([ .spec.containers[]?.resources.requests.cpu | cpu ] | add // 0),
+                  memReq: ([ .spec.containers[]?.resources.requests.memory | mem ] | add // 0),
+                  cpuUse: ($u.cpu | cpu),
+                  memUse: ($u.mem | mem) } ] as $all
+
+          | (["DaemonSet", "Static"]) as $perNode
+          | ([ $all[] | select(.class as $c | $klass == "" or $c == $klass) ]) as $shown
+          | ([ $shown[] | select(.kind as $k | $perNode | index($k) != null) ]) as $agents
+          | ([ $shown[] | select(.kind as $k | $perNode | index($k) == null) ]) as $work
+          | (($alloc | keys) + [ $all[].class ] | unique) as $classes
+
+          | [ ($work | group_by([.ns, .kind, .name, .class])[]
+               | { bucket: "workload", ns: .[0].ns, kind: .[0].kind,
+                   platform: .[0].platform,
+                   name: .[0].name, class: .[0].class, pods: length,
+                   cpuReq: ([.[].cpuReq] | add), memReq: ([.[].memReq] | add),
+                   cpuUse: ([.[].cpuUse] | add), memUse: ([.[].memUse] | add) }),
+              ($agents | group_by([.ns, .kind, .name, .class])[]
+               | { bucket: "agent", ns: .[0].ns, kind: .[0].kind,
+                   platform: .[0].platform,
+                   name: .[0].name, class: .[0].class, pods: length,
+                   cpuReq: ([.[].cpuReq] | add), memReq: ([.[].memReq] | add),
+                   cpuUse: ([.[].cpuUse] | add), memUse: ([.[].memUse] | add) }),
+              # Written out as a matrix rather than grown from the rows, so
+              # that a platform with nothing on a class says zero instead of
+              # going missing.
+              ($classes[] as $c
+               | (if $want == "all" then ["openshift", "projectsyn"] else [$want] end)[] as $plat
+               | ([ $all[] | select(.class == $c and .platform == $plat) ]) as $in
+               | ([ $in[] | select(.kind as $k | $perNode | index($k) != null) ]) as $ag
+               | { bucket: "class", class: $c, platform: $plat,
+                   nodes: ($count[$c] // 0), pods: ($in | length),
+                   allocCpu: ($alloc[$c].cpu // 0), allocMem: ($alloc[$c].mem // 0),
+                   cpuReq: ([$in[].cpuReq] | add // 0), memReq: ([$in[].memReq] | add // 0),
+                   cpuUse: ([$in[].cpuUse] | add // 0), memUse: ([$in[].memUse] | add // 0),
+                   agentCpu: ([$ag[].cpuReq] | add // 0),
+                   agentMem: ([$ag[].memReq] | add // 0) }) ]
+        ' "$d/pods.json" "$d/nodes.json" "$d/top.json"
+    rows: .[] | select(.bucket == "class")
+    key: .class
+    columns:
+      - name: CLASS
+        expr: .class
+      - name: PLATFORM
+        expr: .platform
+      - name: NODES
+        expr: .nodes
+      - name: CPU (cores)
+        expr: .allocCpu / 1000 * 10 | round / 10
+      - name: CPU REQ%
+        expr: if .allocCpu > 0 then (.cpuReq / .allocCpu * 100 | round) else 0 end
+      - name: CPU USE%
+        expr: if .allocCpu > 0 then (.cpuUse / .allocCpu * 100 | round) else 0 end
+      - name: MEM (GiB)
+        expr: .allocMem / 1073741824 | round
+      - name: MEM REQ%
+        expr: if .allocMem > 0 then (.memReq / .allocMem * 100 | round) else 0 end
+      - name: MEM USE%
+        expr: if .allocMem > 0 then (.memUse / .allocMem * 100 | round) else 0 end
+      # What every further node of this class costs on arrival: the agents
+      # and the static pods land on it whether anything else does or not.
+      - name: PER NODE
+        expr: >-
+          if .nodes > 0
+          then "\(.agentCpu / .nodes | round)m + \(.agentMem / .nodes / 1073741824 * 10 | round / 10)Gi"
+          else "" end
+    # The two platforms of one class sit together, because the whole point
+    # of showing both is reading the one against the other.
+    sort:
+      - by: CLASS
+      - by: PLATFORM
+    actions:
+      - key: enter
+        name: nodes
+        short: Show the machines of this class
+        open: nodes.status
+        args:
+          selector: >-
+            if .class == "unscheduled"
+            then error("these pods are on no machine at all")
+            else "node-role.kubernetes.io/\(.class | split(",")[0])" end
+
+      - key: w
+        name: workloads
+        short: Show this class workloads
+        open: platform.workloads
+        args:
+          class: .class
+          platform: .platform
+
+      - key: n
+        name: agents
+        short: Show this class agents
+        open: platform.agents
+        args:
+          class: .class
+          platform: .platform
+
+  # Everything that does not run once per machine: Deployments, StatefulSets
+  # and the few bare pods and catalog sources that turn up in these
+  # namespaces. One row per workload and class, because a Deployment whose
+  # copies straddle two classes costs both of them.
+  - id: platform.workloads
+    title: Deployments and StatefulSets, by class of machine
+    refresh: 2m
+    params:
+      - name: platform
+        short: which platform - openshift, projectsyn, or all for both
+        default: "all"
+      - name: class
+        short: one node class only - master, infra, app, storage
+    source:
+      shell: [bash, -euo, pipefail, -c]
+      script: |
+        d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
+        kubectl get pods -A -o json > "$d/pods.json"
+        kubectl get nodes -o json > "$d/nodes.json"
+        # Best effort, exactly like the pools in nodes.status: without
+        # metrics the requests still answer the capacity question, and a
+        # missing metrics server should not take the view down with it.
+        kubectl top pods -A --no-headers 2>/dev/null \
+          | awk '{printf "{\"ns\":\"%s\",\"name\":\"%s\",\"cpu\":\"%s\",\"mem\":\"%s\"}\n", $1, $2, $3, $4}' \
+          | jq -s '.' > "$d/top.json" || echo '[]' > "$d/top.json"
+        # ${class-} rather than $class: the three views share this script
+        # word for word, and the one that summarises classes has no such
+        # parameter to set. Under set -u the bare name would end the run.
+        # Refused here rather than in jq: a typo should say so before two
+        # kubectl calls have been spent on it.
+        case "$platform" in
+          openshift|projectsyn|all) ;;
+          *) echo "platform takes openshift, projectsyn or all, not \"$platform\"" >&2
+             exit 1 ;;
+        esac
+        jq -s --arg want "$platform" --arg klass "${class-}" '
+          # Kubernetes quantities, into millicores and into bytes. Both
+          # grammars carry a milli suffix, and memory really is written that
+          # way now and then, which is worth catching rather than dying on.
+          def cpu:
+            if . == null then 0
+            elif type == "number" then . * 1000
+            elif endswith("m") then (.[:-1] | tonumber)
+            elif endswith("u") then (.[:-1] | tonumber) / 1000
+            elif endswith("n") then (.[:-1] | tonumber) / 1000000
+            else (tonumber * 1000) end;
+          def mem:
+            if . == null then 0
+            elif type == "number" then .
+            else . as $s
+            | (if   $s | endswith("Ki") then [2, 1024]
+               elif $s | endswith("Mi") then [2, 1048576]
+               elif $s | endswith("Gi") then [2, 1073741824]
+               elif $s | endswith("Ti") then [2, 1099511627776]
+               elif $s | endswith("m")  then [1, 0.001]
+               elif ($s | endswith("k")) or ($s | endswith("K")) then [1, 1000]
+               elif $s | endswith("M")  then [1, 1000000]
+               elif $s | endswith("G")  then [1, 1000000000]
+               elif $s | endswith("T")  then [1, 1000000000000]
+               else [0, 1] end) as [$cut, $mul]
+            | (($s | if $cut > 0 then .[:-$cut] else . end) | tonumber) * $mul
+            end;
+          # The class of a node is its most specific role. worker and
+          # control-plane are dropped as the two that say least: every node
+          # here is a worker, and every master is a control plane.
+          def classOf:
+            [ (.metadata.labels // {}) | keys[]
+              | select(startswith("node-role.kubernetes.io/"))
+              | ltrimstr("node-role.kubernetes.io/") | select(. != "") ]
+            | [ .[] | select(. != "worker" and . != "control-plane") ]
+            | if length > 0 then (sort | join(",")) else "worker" end;
+          # The two platforms, by the namespaces they claim. A namespace can
+          # only match one of them: nothing starts with both. Everything else
+          # is somebody workload rather than the platform, and has no row.
+          def platformOf:
+            if test("^(openshift|kube)(-|$)") then "openshift"
+            elif test("^(cilium|appuio|syn)(-|$)") then "projectsyn"
+            else null end;
+
+          .[1].items as $nodes
+          | ([ $nodes[] | {key: .metadata.name, value: classOf} ] | from_entries) as $class
+          | ([ $nodes[] | classOf ] | group_by(.)
+             | map({key: .[0], value: length}) | from_entries) as $count
+          | ([ $nodes[]
+               | {class: classOf,
+                  cpu: (.status.allocatable.cpu | cpu),
+                  mem: (.status.allocatable.memory | mem)} ]
+             | group_by(.class)
+             | map({key: .[0].class,
+                    value: {cpu: ([.[].cpu] | add), mem: ([.[].mem] | add)}})
+             | from_entries) as $alloc
+          | ([ .[2][] | {key: "\(.ns)/\(.name)", value: .} ] | from_entries) as $use
+
+          # One record per pod, carrying the workload it belongs to and the
+          # class of the machine it actually landed on. Attribution has to
+          # come from the pods: a Deployment does not know where its copies
+          # went, and that is the whole question here.
+          | [ .[0].items[]
+              | (.metadata.namespace | platformOf) as $plat
+              | select($plat != null)
+              | select($want == "all" or $plat == $want)
+              | select(.status.phase == "Running" or .status.phase == "Pending")
+              | (.metadata.ownerReferences[0] // {kind: "Pod", name: .metadata.name}) as $o
+              | ((.metadata.labels // {})["pod-template-hash"] // "") as $hash
+              | (.spec.nodeName // "") as $node
+              | ($use["\(.metadata.namespace)/\(.metadata.name)"] // {}) as $u
+              | { ns: .metadata.namespace,
+                  platform: $plat,
+                  # A ReplicaSet is named after its Deployment plus the hash
+                  # the pod carries as a label, so taking it off is exact
+                  # rather than a guess at where the name ends.
+                  # A mirror pod belongs to its Node, so the owner names the
+                  # machine and not the thing running on it. The pod itself
+                  # is named for both, and taking the machine off leaves the
+                  # agent — which is what puts three masters on one row.
+                  name: (if $o.kind == "ReplicaSet"
+                         then ($o.name | sub("-\($hash)$"; ""))
+                         elif $o.kind == "Node"
+                         then (.metadata.name | sub("-\($node)$"; ""))
+                         else $o.name end),
+                  # Static pods belong to a Node and run one per machine,
+                  # which makes them agents whatever the api calls them.
+                  kind: (if $o.kind == "ReplicaSet" then "Deployment"
+                         elif $o.kind == "Node" then "Static" else $o.kind end),
+                  class: ($class[.spec.nodeName] // "unscheduled"),
+                  cpuReq: ([ .spec.containers[]?.resources.requests.cpu | cpu ] | add // 0),
+                  memReq: ([ .spec.containers[]?.resources.requests.memory | mem ] | add // 0),
+                  cpuUse: ($u.cpu | cpu),
+                  memUse: ($u.mem | mem) } ] as $all
+
+          | (["DaemonSet", "Static"]) as $perNode
+          | ([ $all[] | select(.class as $c | $klass == "" or $c == $klass) ]) as $shown
+          | ([ $shown[] | select(.kind as $k | $perNode | index($k) != null) ]) as $agents
+          | ([ $shown[] | select(.kind as $k | $perNode | index($k) == null) ]) as $work
+          | (($alloc | keys) + [ $all[].class ] | unique) as $classes
+
+          | [ ($work | group_by([.ns, .kind, .name, .class])[]
+               | { bucket: "workload", ns: .[0].ns, kind: .[0].kind,
+                   platform: .[0].platform,
+                   name: .[0].name, class: .[0].class, pods: length,
+                   cpuReq: ([.[].cpuReq] | add), memReq: ([.[].memReq] | add),
+                   cpuUse: ([.[].cpuUse] | add), memUse: ([.[].memUse] | add) }),
+              ($agents | group_by([.ns, .kind, .name, .class])[]
+               | { bucket: "agent", ns: .[0].ns, kind: .[0].kind,
+                   platform: .[0].platform,
+                   name: .[0].name, class: .[0].class, pods: length,
+                   cpuReq: ([.[].cpuReq] | add), memReq: ([.[].memReq] | add),
+                   cpuUse: ([.[].cpuUse] | add), memUse: ([.[].memUse] | add) }),
+              # Written out as a matrix rather than grown from the rows, so
+              # that a platform with nothing on a class says zero instead of
+              # going missing.
+              ($classes[] as $c
+               | (if $want == "all" then ["openshift", "projectsyn"] else [$want] end)[] as $plat
+               | ([ $all[] | select(.class == $c and .platform == $plat) ]) as $in
+               | ([ $in[] | select(.kind as $k | $perNode | index($k) != null) ]) as $ag
+               | { bucket: "class", class: $c, platform: $plat,
+                   nodes: ($count[$c] // 0), pods: ($in | length),
+                   allocCpu: ($alloc[$c].cpu // 0), allocMem: ($alloc[$c].mem // 0),
+                   cpuReq: ([$in[].cpuReq] | add // 0), memReq: ([$in[].memReq] | add // 0),
+                   cpuUse: ([$in[].cpuUse] | add // 0), memUse: ([$in[].memUse] | add // 0),
+                   agentCpu: ([$ag[].cpuReq] | add // 0),
+                   agentMem: ([$ag[].memReq] | add // 0) }) ]
+        ' "$d/pods.json" "$d/nodes.json" "$d/top.json"
+    rows: .[] | select(.bucket == "workload")
+    key: '"\(.ns)/\(.name)/\(.class)"'
+    columns:
+      # A workload with no requests at all is BestEffort: the scheduler
+      # counts it as free and the kubelet kills it first when a node runs
+      # short. One using half again more memory than it asked for is not
+      # doing anything wrong — a request is not a limit — but the number
+      # the scheduler plans with is wrong, which is the same problem one
+      # step earlier.
+      - name: STATE
+        expr: >-
+          if (.cpuReq + .memReq) == 0 then "no requests"
+          elif .memReq > 0 and .memUse > (.memReq * 1.5) then "under-requested"
+          else "" end
+        emphasis: { "no requests": warn, "under-requested": warn }
+      # The prefix the namespace carries says nothing the PLATFORM column
+      # does not, so it comes off — and off the workload name too, but only
+      # that same prefix. Taking any of the five off the name would turn
+      # kube-apiserver in openshift-kube-apiserver into a bare apiserver.
+      - name: WORKLOAD
+        expr: >-
+          .ns as $full
+          | (["openshift-", "kube-", "cilium-", "appuio-", "syn-"]
+             | map(. as $x | select($full | startswith($x))) | first // "") as $p
+          | ($full | ltrimstr($p)) as $ns
+          | (.name | ltrimstr($p)) as $n
+          | if $ns == $n then $ns else "\($ns)/\($n)" end
+      - name: KIND
+        expr: .kind
+      - name: PLATFORM
+        expr: .platform
+      - name: CLASS
+        expr: .class
+      - name: PODS
+        expr: .pods
+      - name: CPU (m)
+        expr: .cpuReq | round
+      - name: CPU USE (m)
+        expr: .cpuUse | round
+      - name: MEM (MiB)
+        expr: .memReq / 1048576 | round
+      - name: MEM USE (MiB)
+        expr: .memUse / 1048576 | round
+    sort:
+      - by: CPU (m)
+        order: desc
+      - by: MEM (MiB)
+        order: desc
+      - by: WORKLOAD
+    actions:
+      - key: enter
+        name: pods
+        short: Show every pod in this namespace
+        open: pods.status
+        args:
+          namespace: .ns
+          show: '"all"'
+
+  # Everything that runs once per machine, which is what makes a cluster
+  # expensive to grow: DaemonSets, and the static control plane pods, which
+  # are agents in everything but name. Every number here is per node, since
+  # that is the number that repeats.
+  - id: platform.agents
+    title: Agents that run on every machine, per node
+    refresh: 2m
+    params:
+      - name: platform
+        short: which platform - openshift, projectsyn, or all for both
+        default: "all"
+      - name: class
+        short: one node class only - master, infra, app, storage
+    source:
+      shell: [bash, -euo, pipefail, -c]
+      script: |
+        d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
+        kubectl get pods -A -o json > "$d/pods.json"
+        kubectl get nodes -o json > "$d/nodes.json"
+        # Best effort, exactly like the pools in nodes.status: without
+        # metrics the requests still answer the capacity question, and a
+        # missing metrics server should not take the view down with it.
+        kubectl top pods -A --no-headers 2>/dev/null \
+          | awk '{printf "{\"ns\":\"%s\",\"name\":\"%s\",\"cpu\":\"%s\",\"mem\":\"%s\"}\n", $1, $2, $3, $4}' \
+          | jq -s '.' > "$d/top.json" || echo '[]' > "$d/top.json"
+        # ${class-} rather than $class: the three views share this script
+        # word for word, and the one that summarises classes has no such
+        # parameter to set. Under set -u the bare name would end the run.
+        # Refused here rather than in jq: a typo should say so before two
+        # kubectl calls have been spent on it.
+        case "$platform" in
+          openshift|projectsyn|all) ;;
+          *) echo "platform takes openshift, projectsyn or all, not \"$platform\"" >&2
+             exit 1 ;;
+        esac
+        jq -s --arg want "$platform" --arg klass "${class-}" '
+          # Kubernetes quantities, into millicores and into bytes. Both
+          # grammars carry a milli suffix, and memory really is written that
+          # way now and then, which is worth catching rather than dying on.
+          def cpu:
+            if . == null then 0
+            elif type == "number" then . * 1000
+            elif endswith("m") then (.[:-1] | tonumber)
+            elif endswith("u") then (.[:-1] | tonumber) / 1000
+            elif endswith("n") then (.[:-1] | tonumber) / 1000000
+            else (tonumber * 1000) end;
+          def mem:
+            if . == null then 0
+            elif type == "number" then .
+            else . as $s
+            | (if   $s | endswith("Ki") then [2, 1024]
+               elif $s | endswith("Mi") then [2, 1048576]
+               elif $s | endswith("Gi") then [2, 1073741824]
+               elif $s | endswith("Ti") then [2, 1099511627776]
+               elif $s | endswith("m")  then [1, 0.001]
+               elif ($s | endswith("k")) or ($s | endswith("K")) then [1, 1000]
+               elif $s | endswith("M")  then [1, 1000000]
+               elif $s | endswith("G")  then [1, 1000000000]
+               elif $s | endswith("T")  then [1, 1000000000000]
+               else [0, 1] end) as [$cut, $mul]
+            | (($s | if $cut > 0 then .[:-$cut] else . end) | tonumber) * $mul
+            end;
+          # The class of a node is its most specific role. worker and
+          # control-plane are dropped as the two that say least: every node
+          # here is a worker, and every master is a control plane.
+          def classOf:
+            [ (.metadata.labels // {}) | keys[]
+              | select(startswith("node-role.kubernetes.io/"))
+              | ltrimstr("node-role.kubernetes.io/") | select(. != "") ]
+            | [ .[] | select(. != "worker" and . != "control-plane") ]
+            | if length > 0 then (sort | join(",")) else "worker" end;
+          # The two platforms, by the namespaces they claim. A namespace can
+          # only match one of them: nothing starts with both. Everything else
+          # is somebody workload rather than the platform, and has no row.
+          def platformOf:
+            if test("^(openshift|kube)(-|$)") then "openshift"
+            elif test("^(cilium|appuio|syn)(-|$)") then "projectsyn"
+            else null end;
+
+          .[1].items as $nodes
+          | ([ $nodes[] | {key: .metadata.name, value: classOf} ] | from_entries) as $class
+          | ([ $nodes[] | classOf ] | group_by(.)
+             | map({key: .[0], value: length}) | from_entries) as $count
+          | ([ $nodes[]
+               | {class: classOf,
+                  cpu: (.status.allocatable.cpu | cpu),
+                  mem: (.status.allocatable.memory | mem)} ]
+             | group_by(.class)
+             | map({key: .[0].class,
+                    value: {cpu: ([.[].cpu] | add), mem: ([.[].mem] | add)}})
+             | from_entries) as $alloc
+          | ([ .[2][] | {key: "\(.ns)/\(.name)", value: .} ] | from_entries) as $use
+
+          # One record per pod, carrying the workload it belongs to and the
+          # class of the machine it actually landed on. Attribution has to
+          # come from the pods: a Deployment does not know where its copies
+          # went, and that is the whole question here.
+          | [ .[0].items[]
+              | (.metadata.namespace | platformOf) as $plat
+              | select($plat != null)
+              | select($want == "all" or $plat == $want)
+              | select(.status.phase == "Running" or .status.phase == "Pending")
+              | (.metadata.ownerReferences[0] // {kind: "Pod", name: .metadata.name}) as $o
+              | ((.metadata.labels // {})["pod-template-hash"] // "") as $hash
+              | (.spec.nodeName // "") as $node
+              | ($use["\(.metadata.namespace)/\(.metadata.name)"] // {}) as $u
+              | { ns: .metadata.namespace,
+                  platform: $plat,
+                  # A ReplicaSet is named after its Deployment plus the hash
+                  # the pod carries as a label, so taking it off is exact
+                  # rather than a guess at where the name ends.
+                  # A mirror pod belongs to its Node, so the owner names the
+                  # machine and not the thing running on it. The pod itself
+                  # is named for both, and taking the machine off leaves the
+                  # agent — which is what puts three masters on one row.
+                  name: (if $o.kind == "ReplicaSet"
+                         then ($o.name | sub("-\($hash)$"; ""))
+                         elif $o.kind == "Node"
+                         then (.metadata.name | sub("-\($node)$"; ""))
+                         else $o.name end),
+                  # Static pods belong to a Node and run one per machine,
+                  # which makes them agents whatever the api calls them.
+                  kind: (if $o.kind == "ReplicaSet" then "Deployment"
+                         elif $o.kind == "Node" then "Static" else $o.kind end),
+                  class: ($class[.spec.nodeName] // "unscheduled"),
+                  cpuReq: ([ .spec.containers[]?.resources.requests.cpu | cpu ] | add // 0),
+                  memReq: ([ .spec.containers[]?.resources.requests.memory | mem ] | add // 0),
+                  cpuUse: ($u.cpu | cpu),
+                  memUse: ($u.mem | mem) } ] as $all
+
+          | (["DaemonSet", "Static"]) as $perNode
+          | ([ $all[] | select(.class as $c | $klass == "" or $c == $klass) ]) as $shown
+          | ([ $shown[] | select(.kind as $k | $perNode | index($k) != null) ]) as $agents
+          | ([ $shown[] | select(.kind as $k | $perNode | index($k) == null) ]) as $work
+          | (($alloc | keys) + [ $all[].class ] | unique) as $classes
+
+          | [ ($work | group_by([.ns, .kind, .name, .class])[]
+               | { bucket: "workload", ns: .[0].ns, kind: .[0].kind,
+                   platform: .[0].platform,
+                   name: .[0].name, class: .[0].class, pods: length,
+                   cpuReq: ([.[].cpuReq] | add), memReq: ([.[].memReq] | add),
+                   cpuUse: ([.[].cpuUse] | add), memUse: ([.[].memUse] | add) }),
+              ($agents | group_by([.ns, .kind, .name, .class])[]
+               | { bucket: "agent", ns: .[0].ns, kind: .[0].kind,
+                   platform: .[0].platform,
+                   name: .[0].name, class: .[0].class, pods: length,
+                   cpuReq: ([.[].cpuReq] | add), memReq: ([.[].memReq] | add),
+                   cpuUse: ([.[].cpuUse] | add), memUse: ([.[].memUse] | add) }),
+              # Written out as a matrix rather than grown from the rows, so
+              # that a platform with nothing on a class says zero instead of
+              # going missing.
+              ($classes[] as $c
+               | (if $want == "all" then ["openshift", "projectsyn"] else [$want] end)[] as $plat
+               | ([ $all[] | select(.class == $c and .platform == $plat) ]) as $in
+               | ([ $in[] | select(.kind as $k | $perNode | index($k) != null) ]) as $ag
+               | { bucket: "class", class: $c, platform: $plat,
+                   nodes: ($count[$c] // 0), pods: ($in | length),
+                   allocCpu: ($alloc[$c].cpu // 0), allocMem: ($alloc[$c].mem // 0),
+                   cpuReq: ([$in[].cpuReq] | add // 0), memReq: ([$in[].memReq] | add // 0),
+                   cpuUse: ([$in[].cpuUse] | add // 0), memUse: ([$in[].memUse] | add // 0),
+                   agentCpu: ([$ag[].cpuReq] | add // 0),
+                   agentMem: ([$ag[].memReq] | add // 0) }) ]
+        ' "$d/pods.json" "$d/nodes.json" "$d/top.json"
+    rows: .[] | select(.bucket == "agent")
+    key: '"\(.ns)/\(.name)/\(.class)"'
+    columns:
+      # A workload with no requests at all is BestEffort: the scheduler
+      # counts it as free and the kubelet kills it first when a node runs
+      # short. One using half again more memory than it asked for is not
+      # doing anything wrong — a request is not a limit — but the number
+      # the scheduler plans with is wrong, which is the same problem one
+      # step earlier.
+      - name: STATE
+        expr: >-
+          if (.cpuReq + .memReq) == 0 then "no requests"
+          elif .memReq > 0 and .memUse > (.memReq * 1.5) then "under-requested"
+          else "" end
+        emphasis: { "no requests": warn, "under-requested": warn }
+      # The prefix the namespace carries says nothing the PLATFORM column
+      # does not, so it comes off — and off the workload name too, but only
+      # that same prefix. Taking any of the five off the name would turn
+      # kube-apiserver in openshift-kube-apiserver into a bare apiserver.
+      - name: AGENT
+        expr: >-
+          .ns as $full
+          | (["openshift-", "kube-", "cilium-", "appuio-", "syn-"]
+             | map(. as $x | select($full | startswith($x))) | first // "") as $p
+          | ($full | ltrimstr($p)) as $ns
+          | (.name | ltrimstr($p)) as $n
+          | if $ns == $n then $ns else "\($ns)/\($n)" end
+      - name: KIND
+        expr: .kind
+      - name: PLATFORM
+        expr: .platform
+      - name: CLASS
+        expr: .class
+      # Fewer pods than the class has machines means this agent is not
+      # everywhere: a nodeSelector, or a taint it does not tolerate.
+      - name: PODS
+        expr: .pods
+      - name: CPU/NODE (m)
+        expr: if .pods > 0 then (.cpuReq / .pods | round) else 0 end
+      - name: CPU USE/NODE (m)
+        expr: if .pods > 0 then (.cpuUse / .pods | round) else 0 end
+      - name: MEM/NODE (MiB)
+        expr: if .pods > 0 then (.memReq / .pods / 1048576 | round) else 0 end
+      - name: MEM USE/NODE (MiB)
+        expr: if .pods > 0 then (.memUse / .pods / 1048576 | round) else 0 end
+    sort:
+      - by: MEM/NODE (MiB)
+        order: desc
+      - by: CPU/NODE (m)
+        order: desc
+      - by: AGENT
+    actions:
+      - key: enter
+        name: nodes
+        short: Show the machines this agent runs on
+        open: nodes.status
+        args:
+          selector: >-
+            if .class == "unscheduled"
+            then error("these pods are on no machine at all")
+            else "node-role.kubernetes.io/\(.class | split(",")[0])" end

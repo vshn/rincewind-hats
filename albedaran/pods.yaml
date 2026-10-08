@@ -152,6 +152,20 @@ views:
         script: |
           kubectl --as system:admin -n "$namespace" delete pod "$name"
         reload: true
+      - key: f
+        name: forcedelete
+        short: Force delete this pod
+        confirm: >-
+          "Delete \(map("\(.metadata.namespace)/\(.metadata.name)") | join(", "))" +
+          (if any(.[]; ((.metadata.ownerReferences // []) | length) == 0)
+           then "\n\nSome of these have no owner — nothing will recreate them."
+           else "\n\nEach one is owned by a controller, which will recreate it." end)
+        env:
+          namespace: .metadata.namespace
+          name: .metadata.name
+        script: |
+          kubectl --as system:admin -n "$namespace" delete pod "$name" --force
+        reload: true
 
   # A disruption budget is the thing that stops a drain, so it is read when a
   # node will not empty. Most of them are fine and say nothing here; the ones

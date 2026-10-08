@@ -144,6 +144,15 @@ views:
         args:
           node: .metadata.name
 
+      # The volumes this node holds: the first place to look when a drain
+      # does not finish or a pod elsewhere waits on a Multi-Attach error.
+      - key: v
+        name: volumes
+        short: Show the volume attachments on this node
+        open: volumes.attachments
+        args:
+          node: .metadata.name
+
       # Cordon only stops new pods landing; it does not move the ones already
       # there. Saying so is the difference between this and a drain, which
       # this tool deliberately does not offer.

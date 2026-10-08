@@ -1,0 +1,571 @@
+# Persistent storage, as Kubernetes sees it: claims, volumes and the
+# attachments that hold a volume on a node. Generic — any CSI driver, any
+# provider. What the storage backend itself says is another hat's business
+# (cloudscale.volumes, for one).
+
+rincewind: ">= 0.7.0"
+
+views:
+  # The claim is what a workload asks for, so it is the place to start. The
+  # state is derived in `rows`, as in pods.status: the phase alone says Bound
+  # through a whole resize, and a stuck resize is one of the things this view
+  # is for.
+  - id: volumes.claims
+    title: Persistent volume claims, their size, state and where they hang
+    params:
+      # Default is all, unlike pods.status: a healthy claim is the one that
+      # gets resized, so the healthy rows are not noise here.
+      - name: show
+        short: all or problems
+        default: all
+      - name: namespace
+        short: namespace, empty for all
+    source:
+      shell: [bash, -euo, pipefail, -c]
+      script: |
+        d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
+        if [ -n "$namespace" ]; then set -- -n "$namespace"; else set -- -A; fi
+        kubectl get persistentvolumeclaims "$@" -o json > "$d/pvc.json"
+        kubectl get pods "$@" -o json > "$d/pods.json"
+        kubectl get persistentvolumes -o json > "$d/pv.json"
+        kubectl get volumeattachments -o json > "$d/va.json"
+        kubectl get storageclasses -o json > "$d/sc.json"
+        # Each claim gets its volume, its class, the nodes that hold it and
+        # the pods that mount it. The lookups are built once as maps; a
+        # nested loop over pods times claims is slow on a large cluster.
+        jq -s '
+          # Kubernetes quantities to bytes, so that sizes can be compared.
+          # Copied in the resize action: expressions cannot share it.
+          def bytes:
+            (tostring | capture("^(?<n>[0-9]+(\\.[0-9]+)?)(?<u>[KMGTPE]i|[kMGTPE])?$")
+              // error("\"\(.)\" is not a size")) as $m
+            | ($m.n | tonumber)
+              * ({Ki: 1024, Mi: 1048576, Gi: 1073741824, Ti: 1099511627776,
+                  Pi: 1125899906842624, Ei: 1152921504606846976,
+                  k: 1e3, M: 1e6, G: 1e9, T: 1e12, P: 1e15, E: 1e18}[$m.u // ""] // 1);
+
+          . as [$pvc, $pods, $pv, $va, $sc]
+          | ([$pv.items[] | {key: .metadata.name, value: .}] | from_entries) as $pvs
+          | ([$sc.items[] | {key: .metadata.name, value: .}] | from_entries) as $scs
+          # Only an attachment that is attached says where a volume is.
+          | (reduce ($va.items[]
+                     | select(.status.attached == true)
+                     | select((.spec.source.persistentVolumeName // "") != ""))
+               as $a ({}; .[$a.spec.source.persistentVolumeName] += [$a.spec.nodeName]))
+            as $attached
+          # A pod that has ended holds nothing.
+          | (reduce ($pods.items[]
+                     | select(.status.phase != "Succeeded" and .status.phase != "Failed")
+                     | .metadata as $m
+                     | .spec.volumes[]?
+                     | (.persistentVolumeClaim.claimName // empty)
+                     | {key: "\($m.namespace)/\(.)", pod: $m.name})
+               as $e ({}; .[$e.key] += [$e.pod]))
+            as $users
+          | $pvc.items[]
+          | $pvs[.spec.volumeName // ""] as $v
+          | . + {
+              pv: $v,
+              sc: $scs[.spec.storageClassName // ""],
+              requestBytes: (.spec.resources.requests.storage // "0" | bytes),
+              capacityBytes: (.status.capacity.storage // "0" | bytes),
+              # A local volume has no attachment; its node is in the
+              # volume affinity instead.
+              nodes: (if $v == null then [] else
+                        ($attached[$v.metadata.name] // [])
+                        + [ $v.spec.nodeAffinity.required.nodeSelectorTerms[]?.matchExpressions[]?
+                            | select(.key == "kubernetes.io/hostname" and .operator == "In")
+                            | .values[] ]
+                        | unique end),
+              pods: ($users["\(.metadata.namespace)/\(.metadata.name)"] // [] | unique)
+            }
+        ' "$d/pvc.json" "$d/pods.json" "$d/pv.json" "$d/va.json" "$d/sc.json"
+    # Deletion first, then the phase when it is not Bound, then the resize
+    # state. Newer clusters report a resize in allocatedResourceStatuses,
+    # older ones only in conditions; both are read. A request larger than
+    # the capacity with neither is a resize that nothing has picked up yet.
+    rows: >-
+      (if ($args.show // "") == "" then "all" else $args.show end) as $show
+      | (if $show == "all" or $show == "problems" then .
+         else error("show takes all or problems, not \"\($show)\"") end)
+      | (.status.allocatedResourceStatuses.storage // "") as $alloc
+      | [.status.conditions[]? | select(.status == "True") | .type] as $cond
+      | ( if .metadata.deletionTimestamp != null then "Terminating"
+          elif .status.phase == "Lost" then "Lost"
+          elif .status.phase == "Pending" then
+            (if (.sc.volumeBindingMode // "") == "WaitForFirstConsumer" and (.pods | length) == 0
+             then "WaitForConsumer" else "Pending" end)
+          elif ($alloc | endswith("Infeasible")) or any($cond[]; endswith("ResizeError"))
+            then "ResizeFailed"
+          elif $alloc == "NodeResizePending" or any($cond[]; . == "FileSystemResizePending")
+            then "FileSystemResizePending"
+          elif $alloc != "" or any($cond[]; . == "Resizing") then "Resizing"
+          elif .requestBytes > .capacityBytes and .capacityBytes > 0 then "Resizing"
+          else .status.phase // "Unknown" end ) as $state
+      | select($show == "all" or $state != "Bound")
+      | . + {state: $state}
+    key: '"\(.metadata.namespace)/\(.metadata.name)"'
+    columns:
+      - name: NAMESPACE
+        expr: .metadata.namespace
+      - name: NAME
+        expr: .metadata.name
+      # FileSystemResizePending is not a fault: the disk has grown, and the
+      # file system grows when a pod next mounts it. It is coloured because
+      # it stays like this until somebody restarts that pod.
+      - name: STATE
+        expr: .state
+        emphasis:
+          { Lost: bad, ResizeFailed: bad, Pending: warn, Terminating: warn,
+            Resizing: warn, FileSystemResizePending: warn,
+            WaitForConsumer: warn, Bound: good }
+      # The capacity as granted. A provisioner can round up, so a capacity
+      # above the request is normal. A request above it is a resize on the
+      # way, and the target follows the arrow.
+      - name: SIZE
+        expr: >-
+          (.status.capacity.storage // "") as $cap
+          | (.spec.resources.requests.storage // "") as $req
+          | if $cap == "" then $req
+            elif .requestBytes > .capacityBytes then "\($cap)→\($req)"
+            else $cap end
+      - name: CLASS
+        expr: .spec.storageClassName // ""
+      # Marked here so that one knows before trying.
+      - name: GROW
+        expr: >-
+          if .sc == null then "?"
+          elif .sc.allowVolumeExpansion then "yes"
+          else "no" end
+        emphasis: { "no": warn, "?": warn }
+      - name: ACCESS
+        expr: >-
+          [.spec.accessModes[]?
+           | {ReadWriteOnce: "RWO", ReadOnlyMany: "ROX", ReadWriteMany: "RWX",
+              ReadWriteOncePod: "RWOP"}[.] // .] | join(",")
+      - name: VOLUME
+        expr: .spec.volumeName // ""
+      - name: NODE
+        expr: .nodes | join(",")
+      - name: PODS
+        expr: .pods | join(",")
+      - name: AGE
+        expr: .metadata.creationTimestamp
+        format: age
+      - name: MESSAGE
+        expr: '[.status.conditions[]? | select((.message // "") != "")][0].message // ""'
+    sort:
+      - by: STATE
+        rank: [Lost, ResizeFailed, Pending, Terminating, Resizing,
+               FileSystemResizePending, WaitForConsumer]
+      - by: NAMESPACE
+      - by: NAME
+    actions:
+      # Every check that can be made before the patch is made here, per
+      # claim, so that the refusal names the claim and nothing is half done.
+      # A claim can only grow; the API refuses a smaller request, and it is
+      # refused here first so that the reason is readable.
+      # `r` is taken by reload, and `g` by the cursor, so expand takes `e`.
+      - key: e
+        name: resize
+        short: Grow this claim
+        params:
+          - name: size
+            short: "new size, as Kubernetes writes it: 50Gi, 1Ti"
+            required: true
+        confirm: >-
+          "Resize to \($args.size):\n\n"
+          + (map("  \(.metadata.namespace)/\(.metadata.name)   \(.status.capacity.storage // "?") → \($args.size)") | join("\n"))
+          + "\n\nA claim can only grow. This cannot be undone."
+          + (if any(.[]; (.pods | length) == 0)
+             then "\n\nSome of these are not mounted. The file system grows when a pod next mounts it."
+             else "" end)
+        env:
+          namespace: .metadata.namespace
+          name: .metadata.name
+          # The patch is made as JSON here, not in the shell, so that the
+          # value cannot break the quoting.
+          patch: |-
+            def bytes:
+              (tostring | capture("^(?<n>[0-9]+(\\.[0-9]+)?)(?<u>[KMGTPE]i|[kMGTPE])?$")
+                // error("\"\(.)\" is not a size; use 50Gi or 1Ti")) as $m
+              | ($m.n | tonumber)
+                * ({Ki: 1024, Mi: 1048576, Gi: 1073741824, Ti: 1099511627776,
+                    Pi: 1125899906842624, Ei: 1152921504606846976,
+                    k: 1e3, M: 1e6, G: 1e9, T: 1e12, P: 1e15, E: 1e18}[$m.u // ""] // 1);
+            "\(.metadata.namespace)/\(.metadata.name)" as $id
+            | ($args.size // "" | gsub("\\s"; "")) as $want
+            | if .status.phase != "Bound" then
+                error("\($id) is \(.status.phase), only a Bound claim can grow")
+              elif .sc == null then
+                error("\($id): storage class \(.spec.storageClassName // "(none)") not found")
+              elif (.sc.allowVolumeExpansion // false) | not then
+                error("\($id): storage class \(.sc.metadata.name) does not allow expansion")
+              elif .pv != null and .pv.spec.csi == null then
+                error("\($id): \(.pv.metadata.name) is not a CSI volume and cannot grow")
+              elif ($want | bytes) <= ([.requestBytes, .capacityBytes] | max) then
+                error("\($id): \($want) is not larger than \(.status.capacity.storage); a claim can only grow")
+              else {spec: {resources: {requests: {storage: $want}}}} | tojson end
+        script: |
+          kubectl --as system:admin -n "$namespace" patch persistentvolumeclaim "$name" \
+            --type merge -p "$patch"
+        reload: true
+
+      - key: enter
+        name: attachments
+        short: Show the attachments of this claim's volume
+        open: volumes.attachments
+        args:
+          pv: >-
+            if (.spec.volumeName // "") == ""
+            then error("\(.metadata.name) has no volume yet")
+            else .spec.volumeName end
+
+      - key: p
+        name: pods
+        short: Show the pods in this claim's namespace
+        open: pods.status
+        args:
+          namespace: .metadata.namespace
+          show: '"all"'
+
+      # What happens to the data depends on the volume, not on the claim:
+      # reclaim policy Delete removes it in the backend, Retain keeps it.
+      # That is the line to read before saying yes.
+      - key: d
+        name: delete
+        short: Delete this claim
+        confirm: >-
+          "Delete \(map("\(.metadata.namespace)/\(.metadata.name)") | join(", "))"
+          + (if any(.[]; (.pv.spec.persistentVolumeReclaimPolicy // "") == "Delete")
+             then "\n\nSome volumes have reclaim policy Delete. THE DATA IS DELETED with the claim."
+             else "\n\nThe volumes have reclaim policy Retain. The data stays; the volume becomes Released." end)
+          + (if any(.[]; (.pods | length) > 0)
+             then "\n\nSome are still mounted. The claim stays Terminating until those pods are gone."
+             else "" end)
+        env:
+          namespace: .metadata.namespace
+          name: .metadata.name
+        script: |
+          kubectl --as system:admin -n "$namespace" delete persistentvolumeclaim "$name" --wait=false
+        reload: true
+
+  # A VolumeAttachment is the record that a volume is attached to a node.
+  # A stale one is the usual cause of "Multi-Attach error" and of a drain
+  # that does not finish, so the state column looks for exactly that: the
+  # node is gone or not ready, the driver reported an error, or the volume
+  # is held on one node while the pod that wants it waits on another.
+  - id: volumes.attachments
+    title: Volume attachments, and which of them hold a volume where it is not wanted
+    refresh: 30s
+    params:
+      # Both set by drill-downs, both optional.
+      - name: pv
+        short: only this persistent volume
+      - name: node
+        short: only this node
+    source:
+      shell: [bash, -euo, pipefail, -c]
+      script: |
+        d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
+        kubectl get volumeattachments -o json > "$d/va.json"
+        kubectl get persistentvolumes -o json > "$d/pv.json"
+        kubectl get nodes -o json > "$d/nodes.json"
+        kubectl get pods -A -o json > "$d/pods.json"
+        jq -s '
+          . as [$va, $pv, $nodes, $pods]
+          | ([$pv.items[] | {key: .metadata.name, value: .}] | from_entries) as $pvs
+          | ([$nodes.items[] | {key: .metadata.name, value: .}] | from_entries) as $nodemap
+          # Every live pod that mounts a claim, with its node. A pod that is
+          # not scheduled yet has no node, and still counts as one that
+          # wants the volume.
+          | (reduce ($pods.items[]
+                     | select(.status.phase != "Succeeded" and .status.phase != "Failed")
+                     | {ns: .metadata.namespace, pod: .metadata.name,
+                        node: (.spec.nodeName // "")} as $p
+                     | .spec.volumes[]?
+                     | (.persistentVolumeClaim.claimName // empty)
+                     | {key: "\($p.ns)/\(.)", pod: $p})
+               as $e ({}; .[$e.key] += [$e.pod]))
+            as $users
+          | $va.items[]
+          | .spec.nodeName as $at
+          | $pvs[.spec.source.persistentVolumeName // ""] as $v
+          | ($v.spec.claimRef // null) as $c
+          | (if $c == null then [] else $users["\($c.namespace)/\($c.name)"] // [] end) as $u
+          | . + {
+              pv: $v,
+              nodeObj: $nodemap[$at],
+              here: [$u[] | select(.node == $at) | .pod],
+              elsewhere: [$u[] | select(.node != $at)]
+            }
+        ' "$d/va.json" "$d/pv.json" "$d/nodes.json" "$d/pods.json"
+    # A gone or unready node comes before the driver errors: it is usually
+    # the cause of them, and force is then the fix.
+    rows: >-
+      select((($args.pv // "") == "" or .spec.source.persistentVolumeName == $args.pv)
+             and (($args.node // "") == "" or .spec.nodeName == $args.node))
+      | ([.nodeObj.status.conditions[]? | select(.type == "Ready")][0].status // "Unknown") as $ready
+      | any(.pv.spec.accessModes[]?; . == "ReadWriteOnce" or . == "ReadWriteOncePod") as $rwo
+      | ( if .nodeObj == null then "node gone"
+          elif .status.detachError != null then "detach error"
+          elif .metadata.deletionTimestamp != null then "detaching"
+          elif $ready != "True" then "node NotReady"
+          elif .status.attachError != null then "attach error"
+          elif (.status.attached // false) | not then "attaching"
+          elif .pv == null and .spec.source.inlineVolumeSpec == null then "pv gone"
+          elif $rwo and (.here | length) == 0 and (.elsewhere | length) > 0 then "multi-attach"
+          elif (.here | length) == 0 then "unused"
+          else "" end ) as $state
+      | . + {state: $state}
+    key: .metadata.name
+    columns:
+      - name: STATE
+        expr: .state
+        emphasis:
+          { "node gone": bad, "node NotReady": bad, "attach error": bad,
+            "detach error": bad, "pv gone": bad, multi-attach: bad,
+            detaching: warn, attaching: warn, unused: warn }
+      - name: NODE
+        expr: .spec.nodeName
+      - name: PV
+        expr: .spec.source.persistentVolumeName // "(inline)"
+      - name: PVC
+        expr: >-
+          (.pv.spec.claimRef // null) as $c
+          | if $c == null then "" else "\($c.namespace)/\($c.name)" end
+      - name: DRIVER
+        expr: .spec.attacher
+      # The pods on this node that use the volume.
+      - name: PODS
+        expr: .here | join(",")
+      - name: AGE
+        expr: .metadata.creationTimestamp
+        format: age
+      # The driver's own words first. For multi-attach, the pod that waits
+      # and where, because that is the pod the volume must move to.
+      - name: MESSAGE
+        expr: >-
+          .status.attachError.message
+          // .status.detachError.message
+          // (if .state == "multi-attach"
+              then "wanted by " + (.elsewhere | map("\(.pod) on \(if .node == "" then "(unscheduled)" else .node end)") | join(", "))
+              else null end)
+          // ""
+    sort:
+      - by: STATE
+        rank: ["node gone", "node NotReady", "detach error", "attach error",
+               multi-attach, "pv gone", detaching, attaching, unused]
+      - by: NODE
+      - by: PV
+    actions:
+      # A normal delete: the driver detaches the volume, then the finalizer
+      # comes off and the object goes. While a pod on that node still uses
+      # the volume, the attach-detach controller makes the object again.
+      - key: d
+        name: delete
+        short: Delete this attachment, and let the driver detach
+        confirm: >-
+          "Delete the attachment of \(map("\(.spec.source.persistentVolumeName // .metadata.name) on \(.spec.nodeName)") | join(", "))"
+          + "\n\nThe CSI driver detaches the volume from the node, then the object goes."
+          + (if any(.[]; (.here | length) > 0)
+             then "\n\nSome are still in use by a pod on that node. The controller attaches them again while that pod runs."
+             else "" end)
+        env:
+          name: .metadata.name
+        script: |
+          kubectl --as system:admin delete volumeattachment "$name" --wait=false
+        reload: true
+
+      # The force removes the finalizer, so the object goes without the
+      # driver. Kubernetes then thinks the volume is free, whatever the
+      # backend thinks. Only safe when the node is gone or the volume is
+      # already detached in the backend; otherwise two nodes can write the
+      # same disk.
+      - key: F
+        name: force
+        short: Delete this attachment without the driver (remove finalizer)
+        confirm: >-
+          "FORCE delete the attachment of \(map("\(.spec.source.persistentVolumeName // .metadata.name) on \(.spec.nodeName) [\(if .state == "" then "ok" else .state end)]") | join(", "))"
+          + "\n\nThe finalizer is removed. The driver does not detach anything."
+          + "\nDo this only when the node is gone, or the volume is already detached in the storage backend."
+          + (if any(.[]; .state != "node gone")
+             then "\n\nSOME OF THESE NODES STILL EXIST. If the volume is still attached there, two nodes can write to it."
+             else "" end)
+        env:
+          name: .metadata.name
+        script: |
+          kubectl --as system:admin delete volumeattachment "$name" --wait=false
+          # Without a finalizer the delete already removed it.
+          if kubectl get volumeattachment "$name" >/dev/null 2>&1; then
+            kubectl --as system:admin patch volumeattachment "$name" \
+              --type merge -p '{"metadata":{"finalizers":null}}'
+          fi
+        reload: true
+
+      - key: enter
+        name: claims
+        short: Show the claims in this volume's namespace
+        open: volumes.claims
+        args:
+          namespace: >-
+            (.pv.spec.claimRef.namespace // null) as $ns
+            | if $ns == null then error("\(.spec.source.persistentVolumeName // .metadata.name) is not claimed")
+              else $ns end
+
+      - key: p
+        name: pods
+        short: Show the pods in this volume's namespace
+        open: pods.status
+        args:
+          namespace: >-
+            (.pv.spec.claimRef.namespace // null) as $ns
+            | if $ns == null then error("\(.spec.source.persistentVolumeName // .metadata.name) is not claimed")
+              else $ns end
+          show: '"all"'
+
+      - key: n
+        name: node
+        short: Show this attachment's node
+        open: nodes.conditions
+        args:
+          node: .spec.nodeName
+
+  # The volumes themselves. A Bound volume is already in volumes.claims, so
+  # the default here is the rest: Released and Available volumes that cost
+  # money and are used by nothing, Failed ones, and Bound ones whose claim
+  # does not exist any more.
+  - id: volumes.pv
+    title: Persistent volumes, and the ones no claim uses
+    params:
+      - name: show
+        short: problems or all
+        default: problems
+    source:
+      shell: [bash, -euo, pipefail, -c]
+      script: |
+        d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
+        kubectl get persistentvolumes -o json > "$d/pv.json"
+        kubectl get persistentvolumeclaims -A -o json > "$d/pvc.json"
+        jq -s '
+          . as [$pv, $pvc]
+          | ([$pvc.items[] | {key: "\(.metadata.namespace)/\(.metadata.name)", value: .}]
+             | from_entries) as $claims
+          | $pv.items[]
+          | (.spec.claimRef // null) as $c
+          | . + {claim: (if $c == null then null else $claims["\($c.namespace)/\($c.name)"] end)}
+        ' "$d/pv.json" "$d/pvc.json"
+    # A claim with the same name but another uid is a new claim, not the
+    # one this volume was made for.
+    rows: >-
+      (if ($args.show // "") == "" then "problems" else $args.show end) as $show
+      | (if $show == "all" or $show == "problems" then .
+         else error("show takes problems or all, not \"\($show)\"") end)
+      | ( if .metadata.deletionTimestamp != null then "Terminating"
+          elif .status.phase == "Bound"
+               and (.claim == null
+                    or ((.spec.claimRef.uid // "") != ""
+                        and .claim.metadata.uid != .spec.claimRef.uid))
+            then "claim gone"
+          else .status.phase // "Unknown" end ) as $state
+      | select($show == "all" or $state != "Bound")
+      | . + {state: $state}
+    key: .metadata.name
+    columns:
+      - name: STATE
+        expr: .state
+        emphasis:
+          { Failed: bad, "claim gone": bad, Released: warn, Available: warn,
+            Pending: warn, Terminating: warn, Bound: good }
+      - name: NAME
+        expr: .metadata.name
+      - name: CLAIM
+        expr: >-
+          (.spec.claimRef // null) as $c
+          | if $c == null then "" else "\($c.namespace)/\($c.name)" end
+      - name: SIZE
+        expr: .spec.capacity.storage // ""
+      # Delete is what happens to the data when the claim goes.
+      - name: RECLAIM
+        expr: .spec.persistentVolumeReclaimPolicy // ""
+      - name: CLASS
+        expr: .spec.storageClassName // ""
+      - name: DRIVER
+        expr: >-
+          .spec.csi.driver
+          // (.spec | to_entries
+               | map(select(.value | type == "object")
+                     | select(.key | IN("claimRef", "capacity", "nodeAffinity") | not)
+                     | .key)
+               | first)
+          // ""
+      - name: NODE
+        expr: >-
+          [.spec.nodeAffinity.required.nodeSelectorTerms[]?.matchExpressions[]?
+           | select(.key == "kubernetes.io/hostname" and .operator == "In")
+           | .values[]] | join(",")
+      - name: AGE
+        expr: .metadata.creationTimestamp
+        format: age
+      - name: MESSAGE
+        expr: .status.message // ""
+    sort:
+      - by: STATE
+        rank: [Failed, "claim gone", Released, Available, Pending, Terminating]
+      - by: NAME
+    actions:
+      # Retain first, then delete the claim: that is how a volume is kept
+      # past its claim. Safe to do at any time.
+      - key: R
+        name: retain
+        short: Keep the data when the claim goes (reclaim policy Retain)
+        confirm: '"Set reclaim policy Retain on \(map(.metadata.name) | join(", "))"'
+        env:
+          name: .metadata.name
+        script: |
+          kubectl --as system:admin patch persistentvolume "$name" \
+            --type merge -p '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}'
+        reload: true
+
+      # A Released volume keeps the reference to its old claim and binds to
+      # nothing else. Removing it makes the volume Available, and the next
+      # claim that matches can take it, with the old data on it.
+      - key: u
+        name: unclaim
+        short: Remove the old claim reference, so that the volume is Available again
+        confirm: >-
+          "Remove the claim reference from \(map(.metadata.name) | join(", "))"
+          + "\n\nThe volume becomes Available. The next claim that matches binds it, with the data that is on it."
+        env:
+          name: >-
+            if .status.phase == "Bound" and .state != "claim gone"
+            then error("\(.metadata.name) is bound to a live claim; delete the claim first")
+            else .metadata.name end
+        script: |
+          kubectl --as system:admin patch persistentvolume "$name" \
+            --type merge -p '{"spec":{"claimRef":null}}'
+        reload: true
+
+      - key: d
+        name: delete
+        short: Delete this volume
+        confirm: >-
+          "Delete \(map(.metadata.name) | join(", "))"
+          + (if any(.[]; (.spec.persistentVolumeReclaimPolicy // "") == "Delete")
+             then "\n\nSome have reclaim policy Delete. THE DISK IN THE STORAGE BACKEND IS DELETED too."
+             else "\n\nAll have reclaim policy Retain. The disk in the storage backend stays, and nothing in the cluster points at it any more." end)
+          + (if any(.[]; .state == "Bound")
+             then "\n\nSome are Bound. They stay Terminating until their claim is gone."
+             else "" end)
+        env:
+          name: .metadata.name
+        script: |
+          kubectl --as system:admin delete persistentvolume "$name" --wait=false
+        reload: true
+
+      - key: enter
+        name: attachments
+        short: Show this volume's attachments
+        open: volumes.attachments
+        args:
+          pv: .metadata.name

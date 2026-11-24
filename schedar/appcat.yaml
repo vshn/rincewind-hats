@@ -1,0 +1,318 @@
+# AppCat 1.0: services as Crossplane composites. A customer's claim (say a
+# VSHNPostgreSQL in their namespace) binds a cluster-scoped composite
+# (XVSHNPostgreSQL), the composition functions render it into composed
+# resources — provider-kubernetes Objects, provider-helm Releases, buckets —
+# and the actual service runs in the instance namespace the composite names
+# in status.instanceNamespace.
+#
+# Debugging one is almost always the same walk: which composite is unhappy,
+# which of its composed resources is the reason, and what that resource says
+# about itself. These views are that walk.
+#
+# Reads and mutations alike impersonate system:admin, so a view shows the
+# whole cluster rather than what the login happens to see. Mutations wear
+# capitals or ask first, like the rest of the hats.
+
+rincewind: ">= 0.7.0"
+
+views:
+  # Every AppCat composite on the cluster, VSHN and exoscale alike. Crossplane
+  # puts every XR CRD in the `composite` category, so one get lists all kinds
+  # without the hat having to know which services this release ships.
+  - id: appcat.instances
+    title: AppCat 1.0 composites and whether they came up
+    needs: appcat
+    refresh: 30s
+    params:
+      - name: show
+        short: failed or all
+        default: all
+      - name: kind
+        short: composite kind, e.g. XVSHNPostgreSQL; empty for all
+    source:
+      script: kubectl --as system:admin get composite -o json
+    # Verdict derived once and attached to the row, so filter, STATE and sort
+    # read the same word. Paused and Deleting win over the conditions: both
+    # explain why the conditions have stopped moving.
+    rows: >-
+      (if ($args.show // "") == "" then "all" else $args.show end) as $show
+      | (if $show == "failed" or $show == "all" then .
+         else error("show takes failed or all, not \"\($show)\"") end)
+      | .items[]
+      | select(.apiVersion | test("(^|\\.)appcat\\.vshn\\.io/"))
+      | select(($args.kind // "") == "" or (.kind | ascii_downcase) == ($args.kind | ascii_downcase))
+      | ([.status.conditions[]? | select(.type == "Synced")][0]) as $sync
+      | ([.status.conditions[]? | select(.type == "Ready")][0]) as $ready
+      | ( if .metadata.deletionTimestamp != null then "Deleting"
+          elif (.metadata.annotations["crossplane.io/paused"] // "") == "true" then "Paused"
+          elif ($sync.status // "") == "False" then "NotSynced"
+          elif ($ready.status // "") == "True" then "Ready"
+          elif $ready == null then "Pending"
+          elif ($ready.reason // "") == "Creating" then "Creating"
+          else "NotReady" end ) as $state
+      | select($show == "all" or $state != "Ready")
+      | . + {state: $state}
+    key: '"\(.kind)/\(.metadata.name)"'
+    columns:
+      - name: KIND
+        expr: .kind
+      - name: NAME
+        expr: .metadata.name
+      # Where the customer sees it. Empty for a composite made directly,
+      # which is how internal instances (e.g. Nextcloud's own PostgreSQL)
+      # are born.
+      - name: CLAIM
+        expr: >-
+          (.spec.claimRef // .spec.crossplane.claimRef // null)
+          | if . == null then "" else "\(.namespace)/\(.name)" end
+      - name: INSTANCE NS
+        expr: .status.instanceNamespace // ""
+      - name: VERSION
+        expr: .status.currentVersion // ""
+      - name: EOL
+        expr: if (.status.isEOL // false) then "EOL" else "" end
+        emphasis: { EOL: warn }
+      - name: STATE
+        expr: .state
+        emphasis:
+          { Ready: good, NotSynced: bad, NotReady: bad, Deleting: warn,
+            Paused: warn, Creating: warn, Pending: warn }
+      - name: SINCE
+        expr: '([.status.conditions[]?.lastTransitionTime] | sort | last) // .metadata.creationTimestamp // ""'
+        format: timestamp
+      # Synced is where a function error lands ("cannot compose resources:
+      # ..."), Ready only says which composed resources are not ready yet.
+      # The more specific one goes first.
+      - name: MESSAGE
+        expr: >-
+          [.status.conditions[]? | select(.status != "True" and (.message // "") != "")]
+          | (map(select(.type == "Synced")) + map(select(.type != "Synced")))[0].message // ""
+    sort:
+      - by: STATE
+        rank: [NotSynced, NotReady, Deleting, Creating, Pending, Paused, Ready]
+      - by: KIND
+      - by: NAME
+    actions:
+      - key: enter
+        name: resources
+        short: Show the resources this composite is made of
+        open: appcat.resources
+        args:
+          resource: '"\(.kind).\(.apiVersion | split("/")[0])"'
+          name: .metadata.name
+
+      - key: c
+        name: conditions
+        short: Show every condition list in the composite's status
+        open: appcat.conditions
+        args:
+          resource: '"\(.kind).\(.apiVersion | split("/")[0])"'
+          name: .metadata.name
+
+      # A paused composite is left alone by Crossplane entirely: functions do
+      # not run, composed resources are not touched. That is what one wants
+      # before editing a composed resource by hand, and what one forgets to
+      # undo, which is why Paused gets its own colour above.
+      - key: p
+        name: pause
+        short: Pause reconciliation of this composite
+        confirm: >-
+          "Pause \(map("\(.kind)/\(.metadata.name)") | join(", "))" +
+          "\n\nCrossplane stops reconciling until unpaused; maintenance and" +
+          " changes to the claim will not reach the instance."
+        env:
+          resource: '"\(.kind).\(.apiVersion | split("/")[0])"'
+          name: .metadata.name
+        script: |
+          kubectl --as system:admin annotate "$resource" "$name" crossplane.io/paused=true --overwrite
+        reload: true
+
+      - key: P
+        name: unpause
+        short: Resume reconciliation of this composite
+        confirm: '"Resume reconciling \(map("\(.kind)/\(.metadata.name)") | join(", "))"'
+        env:
+          resource: '"\(.kind).\(.apiVersion | split("/")[0])"'
+          name: .metadata.name
+        script: |
+          kubectl --as system:admin annotate "$resource" "$name" crossplane.io/paused-
+        reload: true
+
+      # Crossplane reconciles on a poll interval anyway; touching an
+      # annotation gets it done now, which is what one wants after fixing a
+      # secret or a provider config the composite depends on.
+      - key: u
+        name: reconcile
+        short: Ask Crossplane to reconcile now
+        env:
+          resource: '"\(.kind).\(.apiVersion | split("/")[0])"'
+          name: .metadata.name
+        script: |
+          kubectl --as system:admin annotate "$resource" "$name" \
+            "rincewind.vshn.ch/reconcile=$(date -u +%s)" --overwrite
+        reload: true
+
+  # Not listed: it needs a composite to look into. The refs are fetched one by
+  # one because they span kinds and API groups; a ref that no longer resolves
+  # is kept as a row, since a composite pointing at nothing is a finding.
+  - id: appcat.resources
+    title: The composed resources of one AppCat composite
+    needs: appcat
+    refresh: 30s
+    params:
+      - name: resource
+        short: composite kind.group, e.g. XVSHNPostgreSQL.vshn.appcat.vshn.io
+        required: true
+      - name: name
+        short: composite name
+        required: true
+    source:
+      shell: [bash, -euo, pipefail, -c]
+      script: |
+        # Crossplane v1 keeps the refs in spec.resourceRefs, v2 under
+        # spec.crossplane; either is read.
+        kubectl --as system:admin get "$resource" "$name" -o json \
+          | jq -c '(.spec.resourceRefs // .spec.crossplane.resourceRefs // [])[]' \
+          | while read -r ref; do
+              kind=$(jq -r .kind <<<"$ref")
+              api=$(jq -r .apiVersion <<<"$ref")
+              rname=$(jq -r .name <<<"$ref")
+              ns=$(jq -r '.namespace // ""' <<<"$ref")
+              group=${api%/*}
+              if [ "$group" = "$api" ]; then type=$kind; else type=$kind.$group; fi
+              if [ -n "$ns" ]; then set -- -n "$ns"; else set --; fi
+              kubectl --as system:admin get "$type" "$rname" "$@" -o json 2>/dev/null \
+                || jq -nc --argjson ref "$ref" \
+                     '{kind: $ref.kind, apiVersion: $ref.apiVersion, missing: true,
+                       metadata: {name: $ref.name, namespace: ($ref.namespace // "")}}'
+            done
+    rows: >-
+      ([.status.conditions[]? | select(.type == "Synced")][0]) as $sync
+      | ([.status.conditions[]? | select(.type == "Ready")][0]) as $ready
+      | . + {state: (
+          if .missing then "Missing"
+          elif .metadata.deletionTimestamp != null then "Deleting"
+          elif ($sync.status // "") == "False" then "NotSynced"
+          elif ($ready.status // "") == "True" then "Ready"
+          elif $ready == null and $sync == null then "NoConditions"
+          elif $ready == null then "Pending"
+          elif ($ready.reason // "") == "Creating" then "Creating"
+          else "NotReady" end)}
+    key: '"\(.kind)/\(.metadata.namespace // "")/\(.metadata.name)"'
+    columns:
+      - name: KIND
+        expr: .kind
+      - name: NAME
+        expr: .metadata.name
+      # What a provider-kubernetes Object or a helm Release actually puts
+      # into the cluster is the thing one goes and looks at next, so it is
+      # spelled out where it can be.
+      - name: TARGET
+        expr: >-
+          if .kind == "Object" then
+            (.spec.forProvider.manifest // {}) as $m
+            | "\($m.kind // "?") \(($m.metadata.namespace // "") | if . == "" then "" else . + "/" end)\($m.metadata.name // "")"
+          elif .kind == "Release" then
+            "\(.spec.forProvider.chart.name // "?")@\(.spec.forProvider.chart.version // "?") in \(.spec.forProvider.namespace // "?")"
+          else "" end
+      - name: STATE
+        expr: .state
+        emphasis:
+          { Ready: good, Missing: bad, NotSynced: bad, NotReady: bad,
+            Deleting: warn, Creating: warn, Pending: warn }
+      - name: SINCE
+        expr: '([.status.conditions[]?.lastTransitionTime] | sort | last) // .metadata.creationTimestamp // ""'
+        format: timestamp
+      - name: MESSAGE
+        expr: >-
+          [.status.conditions[]? | select(.status != "True" and (.message // "") != "")]
+          | (map(select(.type == "Synced")) + map(select(.type != "Synced")))[0].message // ""
+    sort:
+      - by: STATE
+        rank: [Missing, NotSynced, NotReady, Deleting, Creating, Pending, NoConditions, Ready]
+      - by: KIND
+      - by: NAME
+
+  # AppCat writes far more than Synced and Ready: one condition list per
+  # concern (namespaceConditions, pgclusterConditions, secretConditions, ...)
+  # plus the plain Crossplane conditions. Laid out flat, grouped by list.
+  - id: appcat.conditions
+    title: Every condition an AppCat composite keeps
+    needs: appcat
+    params:
+      - name: resource
+        short: composite kind.group, e.g. XVSHNPostgreSQL.vshn.appcat.vshn.io
+        required: true
+      - name: name
+        short: composite name
+        required: true
+    source:
+      script: kubectl --as system:admin get "$resource" "$name" -o json
+    rows: >-
+      (.status // {}) | to_entries[]
+      | select(.key | test("[cC]onditions$"))
+      | .key as $list | .value[]? | . + {list: $list}
+    key: '"\(.list)/\(.type)"'
+    columns:
+      - name: LIST
+        expr: .list | sub("Conditions$"; "") | sub("^conditions$"; "crossplane")
+      - name: TYPE
+        expr: .type
+      - name: STATUS
+        expr: .status
+        emphasis: { "False": bad, Unknown: warn }
+      - name: REASON
+        expr: .reason // ""
+      - name: WHEN
+        expr: .lastTransitionTime // ""
+        format: timestamp
+      - name: MESSAGE
+        expr: .message // ""
+    sort:
+      - by: STATUS
+        rank: ["False", Unknown, "True"]
+      - by: LIST
+
+  # The machinery under every composite: providers and composition functions.
+  # A function that is not healthy fails every composite of its service at
+  # once, so when a whole kind goes NotSynced this is the first place to look.
+  - id: appcat.packages
+    title: Crossplane providers and functions, and whether they are healthy
+    needs: appcat
+    refresh: 60s
+    source:
+      script: |
+        kubectl --as system:admin get providers.pkg.crossplane.io,functions.pkg.crossplane.io,configurations.pkg.crossplane.io -o json
+    rows: >-
+      .items[]
+      | ([.status.conditions[]? | select(.type == "Installed")][0].status // "") as $inst
+      | ([.status.conditions[]? | select(.type == "Healthy")][0].status // "") as $health
+      | . + {state: (
+          if $inst != "True" then "NotInstalled"
+          elif $health == "False" then "Unhealthy"
+          elif $health == "True" then "Healthy"
+          else "Unknown" end)}
+    key: '"\(.kind)/\(.metadata.name)"'
+    columns:
+      - name: KIND
+        expr: .kind
+      - name: NAME
+        expr: .metadata.name
+      # The registry path is noise; the tag is the part that changes.
+      - name: PACKAGE
+        expr: (.spec.package // "") | split("/") | last
+      - name: REVISION
+        expr: .status.currentRevision // ""
+      - name: STATE
+        expr: .state
+        emphasis: { Healthy: good, Unhealthy: bad, NotInstalled: bad, Unknown: warn }
+      - name: SINCE
+        expr: '([.status.conditions[]?.lastTransitionTime] | sort | last) // ""'
+        format: timestamp
+      - name: MESSAGE
+        expr: '[.status.conditions[]? | select(.status != "True" and (.message // "") != "")][0].message // ""'
+    sort:
+      - by: STATE
+        rank: [NotInstalled, Unhealthy, Unknown, Healthy]
+      - by: KIND
+      - by: NAME

@@ -1,0 +1,173 @@
+# The adept: helmetica's runner of rituals. A reagent ships Definitions
+# (restart, maintenance, whatever the chart adds); an Action names one and
+# the adept runs it as a Job in the instance namespace. A Maintenance turns a
+# ritual into a CronJob inside a MaintenanceWindow.
+#
+# Reads and mutations alike impersonate system:admin.
+
+rincewind: ">= 0.7.0"
+
+views:
+  - id: rituals.actions
+    title: Rituals triggered by Actions, and how their Jobs ended
+    needs: helmetica
+    refresh: 15s
+    params:
+      - name: namespace
+        short: namespace, empty for all
+    source:
+      shell: [bash, -euo, pipefail, -c]
+      script: |
+        if [ -n "$namespace" ]; then
+          kubectl --as system:admin -n "$namespace" get actions.adept.helmetica.io -o json
+        else
+          kubectl --as system:admin get actions.adept.helmetica.io -A -o json
+        fi
+    rows: .items[]
+    key: '"\(.metadata.namespace)/\(.metadata.name)"'
+    columns:
+      - name: NAMESPACE
+        expr: .metadata.namespace
+      - name: NAME
+        expr: .metadata.name
+      - name: RITUAL
+        expr: .spec.type
+      # Empty for an Action created in the instance namespace itself, which
+      # needs no claim to find its way.
+      - name: CLAIM
+        expr: if (.spec.claim // "") == "" then "" else "\(.spec.kind)/\(.spec.claim)" end
+      - name: PHASE
+        expr: .status.phase // "Pending"
+        emphasis: { Succeeded: good, Failed: bad, Running: warn, Pending: warn }
+      - name: JOB
+        expr: .status.jobName // ""
+      - name: CREATED
+        expr: .metadata.creationTimestamp
+        format: timestamp
+      - name: MESSAGE
+        expr: .status.message // ""
+    sort:
+      - by: PHASE
+        rank: [Failed, Running, Pending, Succeeded]
+      - by: CREATED
+    actions:
+      # The Job is owned by the Action and goes with it; what the ritual did
+      # to the service stays done.
+      - key: d
+        name: delete
+        short: Delete this Action and its Job
+        confirm: >-
+          "Delete \(map("\(.metadata.namespace)/\(.metadata.name)") | join(", "))" +
+          (if any(.[]; (.status.phase // "Pending") == "Running")
+           then "\n\nSome of these are still running — deleting stops the Job." else "" end)
+        env:
+          namespace: .metadata.namespace
+          name: .metadata.name
+        script: |
+          kubectl --as system:admin -n "$namespace" delete actions.adept.helmetica.io "$name"
+        reload: true
+
+  - id: rituals.maintenance
+    title: Scheduled maintenance per instance, and the window it runs in
+    needs: helmetica
+    refresh: 60s
+    source:
+      script: kubectl --as system:admin get maintenances.adept.helmetica.io -A -o json
+    rows: .items[]
+    key: '"\(.metadata.namespace)/\(.metadata.name)"'
+    columns:
+      - name: NAMESPACE
+        expr: .metadata.namespace
+      - name: NAME
+        expr: .metadata.name
+      - name: WINDOW
+        expr: .spec.window // "default"
+      - name: RITUAL
+        expr: .spec.ritual // ""
+      # The cron line the window resolved to, which is what actually fires.
+      - name: SCHEDULE
+        expr: .status.schedule // ""
+      - name: STATE
+        expr: >-
+          if (.spec.suspend // false) then "Suspended"
+          elif (.status.observedGeneration // 0) != (.metadata.generation // 0) then "Stale"
+          elif (.status.cronJobName // "") == "" then "NoCronJob"
+          else "Scheduled" end
+        emphasis: { Scheduled: good, Suspended: warn, Stale: warn, NoCronJob: bad }
+      - name: CRONJOB
+        expr: .status.cronJobName // ""
+      - name: MESSAGE
+        expr: .status.message // ""
+    sort:
+      - by: STATE
+        rank: [NoCronJob, Stale, Suspended, Scheduled]
+      - by: NAMESPACE
+    actions:
+      - key: s
+        name: suspend
+        short: Suspend this maintenance
+        confirm: '"Suspend maintenance for \(map("\(.metadata.namespace)/\(.metadata.name)") | join(", "))"'
+        env:
+          namespace: .metadata.namespace
+          name: .metadata.name
+        script: |
+          kubectl --as system:admin -n "$namespace" patch maintenances.adept.helmetica.io "$name" \
+            --type merge -p '{"spec":{"suspend":true}}'
+        reload: true
+
+      - key: S
+        name: resume
+        short: Resume this maintenance
+        confirm: '"Resume maintenance for \(map("\(.metadata.namespace)/\(.metadata.name)") | join(", "))"'
+        env:
+          namespace: .metadata.namespace
+          name: .metadata.name
+        script: |
+          kubectl --as system:admin -n "$namespace" patch maintenances.adept.helmetica.io "$name" \
+            --type merge -p '{"spec":{"suspend":false}}'
+        reload: true
+
+      # Out of window, on purpose: this is for the customer who asked for
+      # their maintenance now, or for checking that the ritual works at all.
+      - key: T
+        name: trigger
+        short: Run the maintenance now, outside its window
+        confirm: >-
+          if any(.[]; (.status.cronJobName // "") == "")
+          then error("no CronJob yet; the adept has not scheduled this maintenance")
+          else "Run maintenance now for \(map("\(.metadata.namespace)/\(.metadata.name)") | join(", "))" +
+               "\n\nThis runs outside the maintenance window."
+          end
+        env:
+          namespace: .metadata.namespace
+          cronjob: .status.cronJobName
+        script: |
+          kubectl --as system:admin -n "$namespace" create job \
+            --from="cronjob/$cronjob" "$cronjob-manual-$(date -u +%s)"
+        reload: false
+
+  # Cluster-scoped: the windows instances pick from. The default one is what
+  # every Maintenance without a window lands in.
+  - id: rituals.windows
+    title: Maintenance windows on offer
+    needs: helmetica
+    source:
+      script: kubectl --as system:admin get maintenancewindows.adept.helmetica.io -o json
+    rows: .items[]
+    key: .metadata.name
+    columns:
+      - name: NAME
+        expr: .metadata.name
+      - name: DEFAULT
+        expr: if (.spec.default // false) then "default" else "" end
+        emphasis: { default: good }
+      - name: DAYS
+        expr: (.spec.daysOfWeek // []) | join(", ")
+      - name: TIME
+        expr: .spec.time // ""
+      - name: DURATION
+        expr: .spec.duration // ""
+      - name: TZ
+        expr: .spec.timeZone // "UTC"
+    sort:
+      - by: NAME

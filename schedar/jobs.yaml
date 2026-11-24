@@ -1,0 +1,112 @@
+# Plain Kubernetes Jobs in AppCat instance namespaces: the namespace an
+# AppCat 1.0 composite or a helmetica claim names in status.instanceNamespace.
+# Backups, maintenance, provisioning hooks — whatever ran there as a Job, and
+# how it ended. AppCat's own syn-appcat* namespaces are in too. Other vshn-*
+# namespaces (vshn-central-*, managed servers) are not instances and stay out.
+#
+# Reads and mutations alike impersonate system:admin.
+
+rincewind: ">= 0.7.0"
+
+views:
+  - id: jobs.appcat
+    title: Jobs in AppCat instance and syn-appcat* namespaces, and how they ended
+    needs: kubernetes
+    refresh: 30s
+    params:
+      - name: show
+        short: failed or all
+        default: all
+    source:
+      shell: [bash, -euo, pipefail, -c]
+      # Either framework may be missing on a cluster, so each lookup falls
+      # back to an empty list rather than failing the view.
+      script: |
+        d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
+        kubectl --as system:admin get composite -o json > "$d/xr.json" 2>/dev/null \
+          || echo '{"items":[]}' > "$d/xr.json"
+        res=$(kubectl --as system:admin get crd -o json | jq -r '
+          [.items[] | select(.spec.group | endswith(".helmetica-bundles.io"))
+           | "\(.spec.names.plural).\(.spec.group)"] | join(",")')
+        if [ -n "$res" ]; then
+          kubectl --as system:admin get "$res" -A -o json > "$d/claims.json"
+        else
+          echo '{"items":[]}' > "$d/claims.json"
+        fi
+        kubectl --as system:admin get jobs.batch -A -o json > "$d/jobs.json"
+        jq -s '
+          . as [$xr, $claims, $jobs]
+          # instance namespace -> the composite or claim that owns it
+          | ( [ ($xr.items[]
+                 | select(.apiVersion | test("(^|\\.)appcat\\.vshn\\.io/"))
+                 | {key: (.status.instanceNamespace // ""), value: "\(.kind)/\(.metadata.name)"}),
+                ($claims.items[]
+                 | {key: (.status.instanceNamespace // ""),
+                    value: "\(.kind) \(.metadata.namespace)/\(.metadata.name)"}) ]
+              | map(select(.key != "")) | from_entries ) as $ns
+          | $jobs.items[]
+          | .metadata.namespace as $n
+          # The AppCat namespaces themselves (syn-appcat, syn-appcat-control, ...)
+          # belong to no instance but are where its controllers run jobs.
+          | select(($ns | has($n)) or ($n | startswith("syn-appcat")))
+          | . + {instance: ($ns[$n] // "AppCat control plane")}
+        ' "$d/xr.json" "$d/claims.json" "$d/jobs.json"
+    # State derived once, as in pods.status, so filter, STATE and sort read
+    # the same word. A Job's conditions are only ever True when they apply.
+    rows: >-
+      (if ($args.show // "") == "" then "all" else $args.show end) as $show
+      | (if $show == "failed" or $show == "all" then .
+         else error("show takes failed or all, not \"\($show)\"") end)
+      | ([.status.conditions[]? | select(.status == "True")]) as $c
+      | ($c | map(select(.type == "Failed")) | first) as $failed
+      | ( if $failed != null then "Failed"
+          elif any($c[]; .type == "Complete") then "Complete"
+          elif (.spec.suspend // false) then "Suspended"
+          elif (.status.active // 0) > 0 then "Running"
+          else "Pending" end ) as $state
+      | select($show == "all" or $state == "Failed")
+      | . + {state: $state, failure: ($failed.message // "")}
+    key: '"\(.metadata.namespace)/\(.metadata.name)"'
+    columns:
+      - name: NAMESPACE
+        expr: .metadata.namespace
+      - name: INSTANCE
+        expr: .instance
+      - name: NAME
+        expr: .metadata.name
+      # What spawned it — a CronJob, a k8up Backup, an adept Action — or
+      # empty for a bare Job.
+      - name: OWNER
+        expr: '[.metadata.ownerReferences[]? | "\(.kind)/\(.name)"][0] // ""'
+      - name: STATE
+        expr: .state
+        emphasis: { Complete: good, Failed: bad, Running: warn, Pending: warn, Suspended: warn }
+      - name: COMPLETIONS
+        expr: '"\(.status.succeeded // 0)/\(.spec.completions // 1)"'
+      - name: FAILED
+        expr: .status.failed // 0
+      - name: STARTED
+        expr: .status.startTime // .metadata.creationTimestamp
+        format: timestamp
+      - name: MESSAGE
+        expr: .failure
+    sort:
+      - by: STATE
+        rank: [Failed, Running, Pending, Suspended, Complete]
+      - by: STARTED
+    actions:
+      # Background cascade takes the Job's pods with it. A CronJob's Job is
+      # not recreated; the CronJob fires again on its next schedule.
+      - key: d
+        name: delete
+        short: Delete this Job and its pods
+        confirm: >-
+          "Delete \(map("\(.metadata.namespace)/\(.metadata.name)") | join(", "))" +
+          (if any(.[]; .state == "Running")
+           then "\n\nSome of these are still running — deleting stops them." else "" end)
+        env:
+          namespace: .metadata.namespace
+          name: .metadata.name
+        script: |
+          kubectl --as system:admin -n "$namespace" delete jobs.batch "$name" --cascade=background
+        reload: true

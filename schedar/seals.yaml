@@ -1,0 +1,37 @@
+# Network access to helmetica services. A Seal in an instance namespace says
+# which namespaces may reach the service; sigillum renders it into the
+# allow-service-access NetworkPolicy. "My app cannot connect" usually ends
+# here: either the namespace is not on the list, or the seal never got Ready.
+
+rincewind: ">= 0.7.0"
+
+views:
+  - id: seals.access
+    title: Who may reach which helmetica service
+    needs: helmetica
+    refresh: 60s
+    source:
+      script: kubectl --as system:admin get seals.seals.helmetica.io -A -o json
+    rows: .items[]
+    key: '"\(.metadata.namespace)/\(.metadata.name)"'
+    columns:
+      - name: NAMESPACE
+        expr: .metadata.namespace
+      - name: NAME
+        expr: .metadata.name
+      - name: ALLOWED
+        expr: >-
+          if (.spec.allowAllNamespaces // false) then "all namespaces"
+          else ((.spec.allowedNamespaces // []) | join(", ")) end
+        emphasis: { "all namespaces": warn }
+      - name: PHASE
+        expr: >-
+          if (.status.observedGeneration // 0) != (.metadata.generation // 0)
+          then "Stale" else (.status.phase // "Pending") end
+        emphasis: { Ready: good, Failed: bad, Pending: warn, Stale: warn }
+      - name: MESSAGE
+        expr: .status.message // ""
+    sort:
+      - by: PHASE
+        rank: [Failed, Stale, Pending, Ready]
+      - by: NAMESPACE

@@ -1,0 +1,102 @@
+# Backups of helmetica services. A BackupPolicy beside a service makes
+# ampulla claim a bucket over COSI, mint the restic password and create a k8up
+# Schedule that backs up every PVC in the namespace. The policy says whether
+# that plumbing is in place; the k8up objects say whether backups actually
+# ran — two different questions, one view each.
+#
+# AppCat 1.0 services back up through their own machinery (StackGres,
+# k8up per composition) and are not covered here.
+
+rincewind: ">= 0.7.0"
+
+views:
+  - id: ampulla.policies
+    title: Backup policies and whether bucket and schedule are in place
+    needs: helmetica
+    refresh: 60s
+    source:
+      script: kubectl --as system:admin get backuppolicies.ampulla.helmetica.io -A -o json
+    rows: .items[]
+    key: '"\(.metadata.namespace)/\(.metadata.name)"'
+    columns:
+      - name: NAMESPACE
+        expr: .metadata.namespace
+      - name: NAME
+        expr: .metadata.name
+      # BucketOnly is a service that drives its own backups and only wants
+      # the storage; nothing below it will show k8up runs.
+      - name: MODE
+        expr: .spec.mode // "Schedule"
+      - name: PHASE
+        expr: >-
+          if (.status.observedGeneration // 0) != (.metadata.generation // 0)
+          then "Stale" else (.status.phase // "Pending") end
+        emphasis: { Ready: good, Failed: bad, Pending: warn, Stale: warn }
+      - name: SCHEDULE
+        expr: .status.schedule // ""
+      - name: BUCKET
+        expr: .status.bucket // ""
+      - name: MESSAGE
+        expr: .status.message // ""
+    sort:
+      - by: PHASE
+        rank: [Failed, Stale, Pending, Ready]
+      - by: NAMESPACE
+    actions:
+      - key: enter
+        name: runs
+        short: Show the k8up runs in this namespace
+        open: ampulla.runs
+        args:
+          namespace: .metadata.namespace
+
+  # The same verdict aldebaran's backups views draw from k8up conditions, for
+  # an instance namespace rather than the cluster backup.
+  - id: ampulla.runs
+    title: k8up backups, checks and prunes in one instance namespace
+    needs: helmetica
+    refresh: 30s
+    params:
+      - name: namespace
+        short: instance namespace
+        required: true
+    source:
+      script: |
+        kubectl --as system:admin -n "$namespace" get \
+          backups.k8up.io,checks.k8up.io,prunes.k8up.io,restores.k8up.io -o json
+    rows: .items[]
+    key: '"\(.kind)/\(.metadata.name)"'
+    columns:
+      - name: NAME
+        expr: .metadata.name
+      - name: KIND
+        expr: .kind
+      - name: STATE
+        expr: >-
+          [.status.conditions[]? | select(.type == "Completed")][0] as $c
+          | [.status.conditions[]? | select(.type == "Progressing")][0] as $p
+          | if $c != null then
+              (if $c.reason == "Succeeded" then "Succeeded"
+               elif $c.reason == "Failed" then "Failed"
+               elif $c.status == "True" then "Succeeded"
+               elif $c.status == "False" then "Failed"
+               else "Unknown" end)
+            elif ($p.status == "True") or (.status.started // false) then "Running"
+            elif (.status.finished // false) then "Unknown"
+            else "Pending" end
+        emphasis: { Succeeded: good, Failed: bad, Running: warn, Pending: warn, Unknown: bad }
+      - name: SINCE
+        expr: >-
+          ([.status.conditions[]?.lastTransitionTime] | sort | last)
+          // .metadata.creationTimestamp // ""
+        format: timestamp
+      - name: MESSAGE
+        expr: >-
+          [.status.conditions[]? | select(.type == "Completed")][0] as $c
+          | [.status.conditions[]? | select(.type == "Progressing")][0] as $p
+          | ($c.message // $p.message // "")
+    sort:
+      - by: STATE
+        rank: [Failed, Unknown, Running, Pending, Succeeded]
+      - by: SINCE
+        order: asc

@@ -1,0 +1,359 @@
+# AppCat 2.0: the helmetica framework. A reagent chart is published as OCI;
+# a ClaimDefinition points chrysopoeia at it, and chrysopoeia generates a CRD
+# in <definition>.helmetica-bundles.io out of the chart's values.yaml. Every
+# instance of that CRD (a claim) gets a ClaimRevision per change — chart
+# version plus values — and the newest *approved* revision is what Flux
+# releases into the instance's own namespace.
+#
+# So the questions are: which claims are not released or have drifted, which
+# revisions wait for approval and what they would change, and whether the
+# definitions and dependency groups underneath are sound.
+#
+# Reads and mutations alike impersonate system:admin.
+
+rincewind: ">= 0.7.0"
+
+views:
+  # The generated CRDs are not known up front — they come with the
+  # definitions — so the script discovers them by group suffix and lists them
+  # all in one get.
+  - id: helmetica.instances
+    title: Helmetica claims and whether their release is in place
+    needs: helmetica
+    refresh: 30s
+    params:
+      - name: show
+        short: failed or all
+        default: all
+      - name: namespace
+        short: claim namespace, empty for all
+    source:
+      shell: [bash, -euo, pipefail, -c]
+      script: |
+        res=$(kubectl --as system:admin get crd -o json | jq -r '
+          [.items[] | select(.spec.group | endswith(".helmetica-bundles.io"))
+           | "\(.spec.names.plural).\(.spec.group)"] | join(",")')
+        if [ -z "$res" ]; then echo '{"items":[]}'; exit 0; fi
+        if [ -n "$namespace" ]; then
+          kubectl --as system:admin -n "$namespace" get "$res" -o json
+        else
+          kubectl --as system:admin get "$res" -A -o json
+        fi
+    # The release controller mirrors the HelmRelease into status.releaseStatus
+    # ("Ready", or the HelmRelease's Ready reason) and status.driftDetected.
+    # A claim without releaseStatus has not got as far as a release.
+    rows: >-
+      (if ($args.show // "") == "" then "all" else $args.show end) as $show
+      | (if $show == "failed" or $show == "all" then .
+         else error("show takes failed or all, not \"\($show)\"") end)
+      | .items[]
+      | (.status // {}) as $s
+      | ( if .metadata.deletionTimestamp != null then "Deleting"
+          elif ($s.driftDetected // false) then "Drifted"
+          elif ($s.releaseStatus // "") == "Ready" then "Ready"
+          elif ($s.releaseStatus // "") != "" then "ReleaseNotReady"
+          elif any($s.conditions[]?; .status == "False") then "Failed"
+          elif ($s.latestRevision // "") == "" then "NoRevision"
+          else "AwaitingRelease" end ) as $state
+      | select($show == "all" or $state != "Ready")
+      | . + {state: $state}
+    key: '"\(.kind)/\(.metadata.namespace)/\(.metadata.name)"'
+    columns:
+      - name: KIND
+        expr: .kind
+      - name: NAMESPACE
+        expr: .metadata.namespace
+      - name: NAME
+        expr: .metadata.name
+      # Wanted and running, folded: one version when they agree, an arrow
+      # when a change has not landed yet.
+      - name: VERSION
+        expr: >-
+          (.spec.version // "") as $want | (.status.version // "") as $have
+          | if $have == "" or $have == $want then $want else "\($have) → \($want)" end
+      - name: APPROVAL
+        expr: .spec.approval.strategy // ""
+        emphasis: { Manual: warn }
+      - name: STATE
+        expr: .state
+        emphasis:
+          { Ready: good, Drifted: bad, Failed: bad, ReleaseNotReady: bad,
+            Deleting: warn, AwaitingRelease: warn, NoRevision: warn }
+      # The HelmRelease's own Ready reason (InstallFailed, UpgradeFailed,
+      # Progressing, ...): open-ended, so kept out of STATE where an unranked
+      # word would sort as though it were fine.
+      - name: RELEASE
+        expr: .status.releaseStatus // ""
+      - name: INSTANCE NS
+        expr: .status.instanceNamespace // ""
+      - name: REVISION
+        expr: .status.latestRevision // ""
+      - name: SINCE
+        expr: '([.status.conditions[]?.lastTransitionTime] | sort | last) // .metadata.creationTimestamp // ""'
+        format: timestamp
+      - name: MESSAGE
+        expr: '[.status.conditions[]? | select(.status != "True" and (.message // "") != "")][0].message // ""'
+    sort:
+      - by: STATE
+        rank: [Failed, ReleaseNotReady, Drifted, AwaitingRelease, NoRevision, Deleting, Ready]
+      - by: KIND
+      - by: NAMESPACE
+      - by: NAME
+    actions:
+      - key: enter
+        name: revisions
+        short: Show this claim's revisions
+        open: helmetica.revisions
+        args:
+          namespace: .metadata.namespace
+          owner: .metadata.name
+
+      - key: t
+        name: actions
+        short: Show the rituals run for claims in this namespace
+        open: rituals.actions
+        args:
+          namespace: .metadata.namespace
+
+      # A ritual is run by creating an Action next to the claim; the adept
+      # resolves the instance namespace from the claim and runs the restart
+      # Definition there. Ferment ships `restart` in every reagent, which is
+      # why this one can be offered without asking what the chart has.
+      # The manifest is built by jq, not a heredoc, so a name taken from the
+      # cluster stays a string.
+      - key: R
+        name: restart
+        short: Run the restart ritual on this instance
+        confirm: >-
+          "Restart \(map("\(.kind) \(.metadata.namespace)/\(.metadata.name)") | join(", "))" +
+          "\n\nThe adept runs the chart's restart ritual as a Job in each instance namespace."
+        env:
+          namespace: .metadata.namespace
+          claim: .metadata.name
+          apiversion: .apiVersion
+          kind: .kind
+        shell: [bash, -euo, pipefail, -c]
+        script: |
+          jq -n --arg claim "$claim" --arg api "$apiversion" --arg kind "$kind" '{
+            apiVersion: "adept.helmetica.io/v1", kind: "Action",
+            metadata: {generateName: "restart-"},
+            spec: {type: "restart", claim: $claim, apiVersion: $api, kind: $kind}}' \
+          | kubectl --as system:admin -n "$namespace" create -f -
+        reload: false
+
+  # Every revision, or one claim's. Which revision is live is not written
+  # anywhere — it is the newest approved one — so it is worked out here per
+  # owner, and every other revision is placed relative to it.
+  - id: helmetica.revisions
+    title: Claim revisions, which one is live and which wait for approval
+    needs: helmetica
+    refresh: 30s
+    params:
+      - name: namespace
+        short: claim namespace, empty for all
+      - name: owner
+        short: claim name, empty for all
+    source:
+      shell: [bash, -euo, pipefail, -c]
+      script: |
+        if [ -n "$namespace" ]; then
+          kubectl --as system:admin -n "$namespace" get claimrevisions.chrysopoeia.helmetica.io -o json
+        else
+          kubectl --as system:admin get claimrevisions.chrysopoeia.helmetica.io -A -o json
+        fi
+    rows: >-
+      [ .items[]
+        | . + {owner: ([.metadata.ownerReferences[]? | select(.controller // true)][0].name // "")}
+        | select(($args.owner // "") == "" or .owner == $args.owner) ]
+      | group_by("\(.metadata.namespace)/\(.owner)")[]
+      | ( map(select(.spec.approvedAt != null)) | sort_by(.spec.approvedAt) | last ) as $live
+      | .[]
+      | . + {verdict: (
+          if $live != null and .metadata.name == $live.metadata.name then "Live"
+          elif .spec.approvedAt != null then "Superseded"
+          elif $live == null or .metadata.creationTimestamp > $live.metadata.creationTimestamp then "Pending"
+          else "Skipped" end)}
+    key: '"\(.metadata.namespace)/\(.metadata.name)"'
+    columns:
+      - name: NAMESPACE
+        expr: .metadata.namespace
+      - name: CLAIM
+        expr: .owner
+      - name: NAME
+        expr: .metadata.name
+      - name: VERSION
+        expr: .spec.version // ""
+      - name: STATE
+        expr: .verdict
+        emphasis: { Live: good, Pending: warn }
+      - name: CREATED
+        expr: .metadata.creationTimestamp // ""
+        format: timestamp
+      - name: APPROVED
+        expr: .spec.approvedAt // ""
+        format: timestamp
+    # What waits for a person first, then what runs; history at the bottom.
+    sort:
+      - by: STATE
+        rank: [Pending, Live, Superseded, Skipped]
+      - by: CREATED
+    actions:
+      - key: enter
+        name: diff
+        short: Show what this revision changes against the live one
+        open: helmetica.revisiondiff
+        args:
+          namespace: .metadata.namespace
+          name: .metadata.name
+
+      # Approving stamps spec.approvedAt; the release controller then picks
+      # the newest approved revision. Approving an old one does not roll
+      # back unless it ends up the newest stamp — which it does, being
+      # stamped now. Said in the prompt, because that is the surprise.
+      - key: A
+        name: approve
+        short: Approve this revision for release
+        confirm: >-
+          if any(.[]; .spec.approvedAt != null)
+          then error("already approved; the newest approved revision is the one released")
+          elif (map("\(.metadata.namespace)/\(.owner)") | unique | length) != length
+          then error("select one revision per claim: only the last one approved would be released")
+          else "Approve \(map("\(.metadata.namespace)/\(.metadata.name) (\(.spec.version))") | join(", "))" +
+               "\n\nThe approved revision becomes the newest approval and is released," +
+               " even if newer unapproved revisions exist."
+          end
+        env:
+          namespace: .metadata.namespace
+          name: .metadata.name
+        shell: [bash, -euo, pipefail, -c]
+        script: |
+          now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          kubectl --as system:admin -n "$namespace" patch claimrevisions.chrysopoeia.helmetica.io "$name" \
+            --type merge -p "{\"spec\":{\"approvedAt\":\"$now\"}}"
+        reload: true
+
+  # Not listed: it needs a revision. The diff is of the whole spec — version,
+  # OCI URL and values — because a values change is what a manual approval
+  # is usually about, and the version alone does not show it.
+  - id: helmetica.revisiondiff
+    title: One claim revision against the one that is live
+    needs: helmetica
+    class: text
+    params:
+      - name: namespace
+        short: revision namespace
+        required: true
+      - name: name
+        short: revision name
+        required: true
+    source:
+      shell: [bash, -euo, pipefail, -c]
+      script: |
+        d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
+        kubectl --as system:admin -n "$namespace" get claimrevisions.chrysopoeia.helmetica.io "$name" -o json > "$d/this.json"
+        uid=$(jq -r '[.metadata.ownerReferences[]?][0].uid // ""' "$d/this.json")
+        kubectl --as system:admin -n "$namespace" get claimrevisions.chrysopoeia.helmetica.io -o json \
+          | jq --arg uid "$uid" '
+              [.items[] | select(any(.metadata.ownerReferences[]?; .uid == $uid))
+               | select(.spec.approvedAt != null)] | sort_by(.spec.approvedAt) | last // empty' \
+          > "$d/live.json"
+        if [ ! -s "$d/live.json" ]; then
+          echo "No approved revision yet — this would be the first release:"
+          echo
+          jq -S '.spec | del(.approvedAt)' "$d/this.json"
+          exit 0
+        fi
+        live=$(jq -r .metadata.name "$d/live.json")
+        if [ "$live" = "$name" ]; then
+          echo "$name is the live revision."
+          exit 0
+        fi
+        jq -S '.spec | del(.approvedAt)' "$d/live.json" > "$d/a"
+        jq -S '.spec | del(.approvedAt)' "$d/this.json" > "$d/b"
+        diff -u --label "$live (live)" --label "$name" "$d/a" "$d/b" || true
+
+  # The sources the CRDs are generated from. A definition that is not Ready
+  # means its CRD is stale or missing — every claim of that service is stuck
+  # on whatever schema was last applied.
+  - id: helmetica.definitions
+    title: Claim definitions and whether their CRD is generated
+    needs: helmetica
+    refresh: 60s
+    source:
+      script: kubectl --as system:admin get claimdefinitions.chrysopoeia.helmetica.io -A -o json
+    rows: .items[]
+    key: '"\(.metadata.namespace)/\(.metadata.name)"'
+    columns:
+      - name: NAMESPACE
+        expr: .metadata.namespace
+      - name: NAME
+        expr: .metadata.name
+      - name: SOURCE
+        expr: .spec.reference.name // ""
+      # Flux revisions are "<tag>@sha256:<digest>"; the tag is what a person
+      # recognises.
+      - name: REVISION
+        expr: (.status.appliedReferenceRevision // "") | split("@")[0]
+      - name: REQUIRES
+        expr: '[.spec.requires[]?.dependencyGroup.name] | join(", ")'
+      - name: STATE
+        expr: >-
+          [.status.conditions[]? | select(.type == "Ready")][0] as $r
+          | if $r == null then "Pending" elif $r.status == "True" then "Ready"
+            else "NotReady" end
+        emphasis: { Ready: good, NotReady: bad, Pending: warn }
+      - name: REASON
+        expr: '[.status.conditions[]? | select(.type == "Ready")][0].reason // ""'
+      - name: SINCE
+        expr: '([.status.conditions[]?.lastTransitionTime] | sort | last) // ""'
+        format: timestamp
+      - name: MESSAGE
+        expr: '[.status.conditions[]? | select(.status != "True")][0].message // ""'
+    sort:
+      - by: STATE
+        rank: [NotReady, Pending, Ready]
+      - by: NAME
+
+  # Dependency groups bundle an operator's CRDs; a rejected group is one
+  # whose CRD another group already claims, and no definition can use it.
+  # Their harness is listed beside them, since a group is only as good as
+  # the operator harnessed to serve it.
+  - id: helmetica.dependencies
+    title: Dependency groups, their harnesses, and which are rejected
+    needs: helmetica
+    refresh: 60s
+    source:
+      script: |
+        kubectl --as system:admin get dependencygroups.chrysopoeia.helmetica.io,operatorharnesses.chrysopoeia.helmetica.io -o json
+    rows: .items[]
+    key: '"\(.kind)/\(.metadata.name)"'
+    columns:
+      - name: KIND
+        expr: .kind
+      - name: NAME
+        expr: .metadata.name
+      # For a group, its CRDs; for a harness, where the operator runs and the
+      # label it is scoped to.
+      - name: DETAIL
+        expr: >-
+          if .kind == "DependencyGroup"
+          then "\([.spec.crds[]?.name] | join(", "))" +
+               (if .spec.harnessRef then " (harness \(.spec.harnessRef.name))" else "" end)
+          else "\(.spec.operator.namespace) scoped to \(.spec.scopeToLabel)" +
+               (if .spec.operator.injectProxyConfiguration then ", proxied" else "" end)
+          end
+      - name: STATE
+        expr: >-
+          if .kind == "DependencyGroup" then (.status.state // "Pending")
+          else ([.status.conditions[]? | select(.type == "Ready")][0]
+                | if . == null then "Pending" elif .status == "True" then "Ready"
+                  else "NotReady" end)
+          end
+        emphasis: { Accepted: good, Ready: good, Rejected: bad, NotReady: bad, Pending: warn }
+      - name: MESSAGE
+        expr: '[.status.conditions[]? | select(.status != "True")][0].message // ""'
+    sort:
+      - by: STATE
+        rank: [Rejected, NotReady, Pending, Accepted, Ready]
+      - by: KIND
+      - by: NAME

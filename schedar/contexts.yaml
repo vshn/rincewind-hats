@@ -1,0 +1,50 @@
+# Where one is, as schedar cares about it: which cluster, and which of the
+# two service frameworks it carries. AppCat 1.0 is Crossplane composing
+# services out of the vshn.appcat.vshn.io XRDs; AppCat 2.0 is helmetica,
+# where chrysopoeia turns reagent charts into CRDs and Flux releases them.
+#
+# A cluster can carry either, both or neither, so each is its own context and
+# the views name the one they need — on a cluster without helmetica its views
+# are not offered rather than offered and broken.
+#
+# The two framework contexts read the same discovery document, down to the
+# character, so the engine runs it once per round rather than twice.
+
+rincewind: ">= 0.7.0"
+
+contexts:
+  # The kubeconfig and nothing else, so it answers when the cluster does not.
+  # Same shortening as aldebaran's: an `oc login` context is cut down to the
+  # API host.
+  - id: kubernetes
+    short: The cluster the scripts will run against
+    source:
+      script: kubectl config view --minify -o json
+    label: >-
+      ."current-context"
+      | if test("/")
+        then split("/")[1] | sub("^api-"; "") | sub(":[0-9]+$"; "")
+        else .
+        end
+    tools: [kubectl, jq]
+
+  # The API group the XRDs register their composites under. Its presence is
+  # the framework's presence: no group, no AppCat 1.0 here.
+  - id: appcat
+    short: AppCat 1.0 (Crossplane compositions)
+    source:
+      script: kubectl --as system:admin get --raw /apis
+    label: '"AppCat"'
+    active: 'any(.groups[]; .name == "vshn.appcat.vshn.io")'
+    tools: [kubectl, jq]
+
+  # chrysopoeia's own group, which holds ClaimDefinitions and ClaimRevisions.
+  # The generated service groups (*.helmetica-bundles.io) come and go with the
+  # definitions; this one is there as soon as the framework is.
+  - id: helmetica
+    short: AppCat 2.0 (helmetica framework)
+    source:
+      script: kubectl --as system:admin get --raw /apis
+    label: '"Helmetica"'
+    active: 'any(.groups[]; .name == "chrysopoeia.helmetica.io")'
+    tools: [kubectl, jq]
